@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""3CX Configuration REST API CLI Tool"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import requests
+from urllib.parse import urljoin
+
+CONFIG_FILE = os.environ.get("THREECX_CONFIG_FILE", os.path.expanduser("~/.3cx-config.json"))
+
+def load_config():
+    """Load config from environment variables, falling back to config file."""
+    fqdn = os.environ.get("THREECX_FQDN", "")
+    if fqdn:
+        return {
+            "fqdn": fqdn,
+            "client_id": os.environ.get("THREECX_CLIENT_ID", ""),
+            "client_secret": os.environ.get("THREECX_CLIENT_SECRET", ""),
+        }
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_config(config):
+    """Save config to file (only when not using env vars)."""
+    if os.environ.get("THREECX_FQDN"):
+        return  # Using env vars, don't write file
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
+
+def get_token(fqdn, client_id, client_secret):
+    url = f"https://{fqdn}/connect/token"
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "client_credentials"
+    }
+    resp = requests.post(url, data=data)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_headers(config):
+    now = time.time()
+    if config.get("access_token") and config.get("token_expiry", 0) > now + 5:
+        token = config["access_token"]
+    else:
+        token_data = get_token(config["fqdn"], config["client_id"], config["client_secret"])
+        config["access_token"] = token_data["access_token"]
+        config["token_expiry"] = now + token_data.get("expires_in", 3600)
+        save_config(config)
+        token = config["access_token"]
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def api_url(config, path):
+    return f"https://{config['fqdn']}/xapi/v1/{path}"
+
+def handle_response(resp):
+    if resp.status_code >= 400:
+        print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    if resp.text:
+        try:
+            print(json.dumps(resp.json(), indent=2))
+        except (json.JSONDecodeError, requests.exceptions.JSONDecodeError):
+            print(resp.text)
+    else:
+        print(f"Success: {resp.status_code}")
+
+def add_list_args(parser):
+    """Add --top/--skip/--filter to any list subcommand."""
+    parser.add_argument("--top", type=int, default=100, help="Max items to return")
+    parser.add_argument("--skip", type=int, default=0, help="Items to skip")
+    parser.add_argument("--filter", dest="odata_filter", help="OData $filter expression")
+
+def build_list_params(args):
+    """Build OData query dict from parsed args."""
+    params = {"$top": args.top, "$skip": args.skip, "$orderby": "Id"}
+    if hasattr(args, "odata_filter") and args.odata_filter:
+        params["$filter"] = args.odata_filter
+    return params
+
+# -- Existing Commands ---------------------------------------------------------
+
+def cmd_config(args):
+    fqdn = args.fqdn.replace("https://", "").replace("http://", "").strip("/")
+    config = {
+        "fqdn": fqdn,
+        "client_id": args.client_id,
+        "client_secret": args.client_secret
+    }
+    save_config(config)
+    print("Configuration saved.")
+
+def cmd_get_token(args):
+    config = load_config()
+    token = get_token(config["fqdn"], config["client_id"], config["client_secret"])
+    print(json.dumps(token, indent=2))
+
+def cmd_departments(args):
+    config = load_config()
+    headers = get_headers(config)
+    params = build_list_params(args)
+    if args.name:
+        params["$filter"] = f"Name eq '{args.name}'"
+    resp = requests.get(api_url(config, "Groups"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_create_department(args):
+    config = load_config()
+    headers = get_headers(config)
+    data = {
+        "AllowCallService": True,
+        "Id": 0,
+        "Language": args.language,
+        "Name": args.name,
+        "PromptSet": args.prompt_set,
+        "Props": {
+            "LiveChatMaxCount": 20,
+            "PersonalContactsMaxCount": 500,
+            "PromptsMaxCount": 10,
+            "SystemNumberFrom": args.sys_from,
+            "SystemNumberTo": args.sys_to,
+            "TrunkNumberFrom": args.trunk_from,
+            "TrunkNumberTo": args.trunk_to,
+            "UserNumberFrom": args.user_from,
+            "UserNumberTo": args.user_to
+        },
+        "TimeZoneId": args.timezone,
+        "DisableCustomPrompt": True
+    }
+    resp = requests.post(api_url(config, "Groups"), headers=headers, json=data)
+    handle_response(resp)
+
+def cmd_delete_department(args):
+    config = load_config()
+    headers = get_headers(config)
+    resp = requests.post(api_url(config, "Groups/Pbx.DeleteCompanyById"), headers=headers, json={"Id": args.id})
+    handle_response(resp)
+
+def cmd_update_department(args):
+    config = load_config()
+    headers = get_headers(config)
+    data = {}
+    if args.transcription is not None:
+        data["TranscriptionMode"] = args.transcription
+    if not data:
+        print("Error: No update flags provided. Use --transcription.", file=sys.stderr)
+        sys.exit(1)
+    resp = requests.patch(api_url(config, f"Groups({args.id})"), headers=headers, json=data)
+    handle_response(resp)
+
+def cmd_users(args):
+    config = load_config()
+    headers = get_headers(config)
+    params = build_list_params(args)
+    params["$orderby"] = "Number"
+    if args.email:
+        params["$filter"] = f"tolower(EmailAddress) eq '{args.email.lower()}'"
+        params["$top"] = 1
+    url = api_url(config, "Users")
+    resp = requests.get(url, headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_create_user(args):
+    config = load_config()
+    headers = get_headers(config)
+    data = {
+        "AccessPassword": args.password,
+        "EmailAddress": args.email,
+        "FirstName": args.first_name,
+        "LastName": args.last_name,
+        "Id": 0,
+        "Language": args.language,
+        "Number": args.extension,
+        "PromptSet": args.prompt_set,
+        "SendEmailMissedCalls": True,
+        "VMEmailOptions": "Notification",
+        "Require2FA": False
+    }
+    resp = requests.post(api_url(config, "Users"), headers=headers, json=data)
+    handle_response(resp)
+
+def cmd_delete_users(args):
+    config = load_config()
+    headers = get_headers(config)
+    resp = requests.post(api_url(config, "Users/Pbx.BatchDelete"), headers=headers, json={"ids": args.ids})
+    handle_response(resp)
+
+def cmd_assign_role(args):
+    config = load_config()
+    headers = get_headers(config)
+    data = {"Groups": [{"GroupId": args.group_id, "Rights": {"RoleName": args.role}}], "Id": args.user_id}
+    resp = requests.patch(api_url(config, f"Users({args.user_id})"), headers=headers, json=data)
+    handle_response(resp)
+
+def cmd_live_chat(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.check:
+        url = api_url(config, f"WebsiteLinks?$filter=Link eq '{args.check}'")
+        resp = requests.get(url, headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "WebsiteLinks"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_create_live_chat(args):
+    config = load_config()
+    headers = get_headers(config)
+    data = {
+        "Advanced": {"CommunicationOptions": "PhoneAndChat", "EnableDirectCall": True, "IgnoreQueueOwnership": False, "CallTitle": ""},
+        "CallsEnabled": True,
+        "ChatEnabled": True,
+        "DefaultRecord": True,
+        "DN": {"Id": args.group_id, "Name": args.group_name, "Number": args.group_number, "Type": "Group"},
+        "General": {"AllowSoundNotifications": True, "Authentication": "None", "DisableOfflineMessages": False, "Greeting": "DesktopAndMobile"},
+        "Group": args.group_number,
+        "Link": args.link,
+        "Name": "",
+        "Styling": {"Animation": "NoAnimation", "Minimized": True},
+        "Translations": {"GreetingMessage": "", "StartChatButtonText": "", "UnavailableMessage": ""},
+        "Website": []
+    }
+    resp = requests.post(api_url(config, "WebsiteLinks"), headers=headers, json=data)
+    handle_response(resp)
+
+def cmd_parking(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.create:
+        data = {"Groups": [{"GroupId": gid} for gid in args.group_ids], "Id": 0}
+        resp = requests.post(api_url(config, "Parkings"), headers=headers, json=data)
+    elif args.delete:
+        resp = requests.delete(api_url(config, f"Parkings({args.delete})"), headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "Parkings"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_version(args):
+    config = load_config()
+    headers = get_headers(config)
+    resp = requests.get(api_url(config, "SystemStatus"), headers=headers)
+    data = resp.json()
+    if resp.status_code < 400:
+        print(json.dumps({"Version": data.get("Version"), "FQDN": data.get("FQDN")}, indent=2))
+    else:
+        handle_response(resp)
+
+# -- Tier 1 - System Operations -----------------------------------------------
+
+def cmd_system_status(args):
+    config = load_config()
+    headers = get_headers(config)
+    resp = requests.get(api_url(config, "SystemStatus"), headers=headers)
+    handle_response(resp)
+
+def cmd_active_calls(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.drop:
+        resp = requests.post(api_url(config, f"ActiveCalls({args.drop})/Pbx.DropCall"), headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "ActiveCalls"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_recordings(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.download:
+        resp = requests.get(api_url(config, f"Recordings/Pbx.DownloadRecording(recId={args.download})"), headers=headers)
+        if resp.status_code >= 400:
+            print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+            sys.exit(1)
+        fname = f"recording_{args.download}.wav"
+        with open(fname, "wb") as f:
+            f.write(resp.content)
+        print(f"Saved to {fname}")
+    elif args.delete:
+        resp = requests.post(api_url(config, "Recordings/Pbx.BulkRecordingsDelete"), headers=headers, json={"Ids": args.delete})
+        handle_response(resp)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "Recordings"), headers=headers, params=params)
+        handle_response(resp)
+
+def cmd_call_history(args):
+    config = load_config()
+    headers = get_headers(config)
+    params = build_list_params(args)
+    params.pop("$orderby", None)
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    default_start = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    default_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    start = args.start or default_start
+    end = args.end or default_end
+    path = (
+        f"ReportCallLogData/Pbx.GetCallLogData("
+        f"periodFrom={start},"
+        f"periodTo={end},"
+        f"sourceType=0,sourceFilter='',"
+        f"destinationType=0,destinationFilter='',"
+        f"callsType=0,"
+        f"callTimeFilterType=0,"
+        f"callTimeFilterFrom='00:00',callTimeFilterTo='23:59',"
+        f"hidePcalls=true)"
+    )
+    resp = requests.get(api_url(config, path), headers=headers, params=params)
+    handle_response(resp)
+
+# -- Tier 2 - Routing & Call Flow ----------------------------------------------
+
+def cmd_inbound_rules(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.delete:
+        resp = requests.post(api_url(config, "InboundRules/Pbx.BulkInboundRulesDelete"), headers=headers, json={"Ids": args.delete})
+    elif args.id:
+        resp = requests.get(api_url(config, f"InboundRules({args.id})"), headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "InboundRules"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_outbound_rules(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.delete:
+        resp = requests.post(api_url(config, "OutboundRules/Pbx.BulkNumbersDelete"), headers=headers, json={"Ids": args.delete})
+    elif args.id:
+        resp = requests.get(api_url(config, f"OutboundRules({args.id})"), headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "OutboundRules"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_ivrs(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.id:
+        resp = requests.get(api_url(config, f"CallFlowApps({args.id})"), headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "CallFlowApps"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_queues(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.id:
+        resp = requests.get(api_url(config, f"Queues({args.id})"), headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "Queues"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_ring_groups(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.id:
+        resp = requests.get(api_url(config, f"RingGroups({args.id})"), headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "RingGroups"), headers=headers, params=params)
+    handle_response(resp)
+
+# -- Tier 3 - Infrastructure --------------------------------------------------
+
+def cmd_trunks(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.delete:
+        resp = requests.post(api_url(config, "Trunks/Pbx.BulkNumbersDelete"), headers=headers, json={"Ids": args.delete})
+    elif args.id:
+        resp = requests.get(api_url(config, f"Trunks({args.id})"), headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "Trunks"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_phones(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.delete:
+        resp = requests.post(api_url(config, "SipDevices/Pbx.BulkNumbersDelete"), headers=headers, json={"Ids": args.delete})
+    elif args.id:
+        resp = requests.get(api_url(config, f"SipDevices({args.id})"), headers=headers)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "SipDevices"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_contacts(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.export:
+        resp = requests.get(api_url(config, "Contacts/Pbx.Export"), headers=headers)
+        if resp.status_code >= 400:
+            print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+            sys.exit(1)
+        fname = "contacts_export.csv"
+        with open(fname, "wb") as f:
+            f.write(resp.content)
+        print(f"Exported to {fname}")
+    elif args.delete:
+        resp = requests.post(api_url(config, "Contacts/Pbx.BulkNumbersDelete"), headers=headers, json={"Ids": args.delete})
+        handle_response(resp)
+    elif args.id:
+        resp = requests.get(api_url(config, f"Contacts({args.id})"), headers=headers)
+        handle_response(resp)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "Contacts"), headers=headers, params=params)
+        handle_response(resp)
+
+# -- Tier 4 - Security --------------------------------------------------------
+
+def cmd_blacklist(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.add:
+        resp = requests.post(api_url(config, "BlackListNumbers"), headers=headers, json={"Number": args.add, "Id": 0})
+        handle_response(resp)
+    elif args.delete:
+        resp = requests.post(api_url(config, "BlackListNumbers/Pbx.BulkNumbersDelete"), headers=headers, json={"Ids": args.delete})
+        handle_response(resp)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "BlackListNumbers"), headers=headers, params=params)
+        handle_response(resp)
+
+def cmd_ip_blocklist(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.add:
+        resp = requests.post(api_url(config, "Blocklist"), headers=headers, json={"IpAddress": args.add, "Id": 0, "Description": args.description or ""})
+        handle_response(resp)
+    elif args.delete:
+        resp = requests.post(api_url(config, "Blocklist/Pbx.BulkIpsDelete"), headers=headers, json={"Ids": args.delete})
+        handle_response(resp)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "Blocklist"), headers=headers, params=params)
+        handle_response(resp)
+
+def cmd_activity_log(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.purge:
+        resp = requests.post(api_url(config, "ActivityLog/Pbx.PurgeLogs"), headers=headers)
+    else:
+        params = build_list_params(args)
+        params.pop("$orderby", None)
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        default_start = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        default_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        start = args.start or default_start
+        end = args.end or default_end
+        ext = args.extension or ""
+        call = args.call_id or ""
+        severity = args.severity or ""
+        path = f"ActivityLog/Pbx.GetLogs(startDate={start},endDate={end},extension='{ext}',call='{call}',severity='{severity}')"
+        resp = requests.get(api_url(config, path), headers=headers, params=params)
+    handle_response(resp)
+
+# -- Tier 5 - System Control ---------------------------------------------------
+
+def cmd_backups(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.create:
+        resp = requests.post(api_url(config, "Backups"), headers=headers)
+    elif args.restore:
+        resp = requests.post(api_url(config, f"Backups('{args.restore}')/Pbx.Restore"), headers=headers)
+    else:
+        params = build_list_params(args)
+        params["$orderby"] = "CreationTime desc"
+        resp = requests.get(api_url(config, "Backups"), headers=headers, params=params)
+    handle_response(resp)
+
+def cmd_restart(args):
+    if not args.confirm:
+        print("Error: --confirm flag required to restart the PBX", file=sys.stderr)
+        sys.exit(1)
+    config = load_config()
+    headers = get_headers(config)
+    resp = requests.post(api_url(config, "Services/Pbx.Restart"), headers=headers)
+    handle_response(resp)
+
+def cmd_emergency_numbers(args):
+    config = load_config()
+    headers = get_headers(config)
+    if args.add:
+        resp = requests.post(api_url(config, "EmergencyGeoLocations"), headers=headers, json={"FriendlyName": args.name or args.add, "Id": 0})
+        handle_response(resp)
+    elif args.delete:
+        resp = requests.post(api_url(config, "EmergencyGeoLocations/Pbx.BulkNumbersDelete"), headers=headers, json={"Ids": args.delete})
+        handle_response(resp)
+    else:
+        params = build_list_params(args)
+        resp = requests.get(api_url(config, "EmergencyGeoLocations"), headers=headers, params=params)
+        handle_response(resp)
+
+# -- CLI Entry Point -----------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="3CX Configuration REST API CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # config, token
+    p_config = subparsers.add_parser("config", help="Save API credentials")
+    p_config.add_argument("--fqdn", required=True, help="PBX FQDN")
+    p_config.add_argument("--client-id", required=True, help="Client ID")
+    p_config.add_argument("--client-secret", required=True, help="Client Secret")
+    p_config.set_defaults(func=cmd_config)
+
+    p_token = subparsers.add_parser("token", help="Get access token")
+    p_token.set_defaults(func=cmd_get_token)
+
+    # version, system-status
+    p_version = subparsers.add_parser("version", help="Get 3CX version")
+    p_version.set_defaults(func=cmd_version)
+
+    p_status = subparsers.add_parser("system-status", help="Get system status")
+    p_status.set_defaults(func=cmd_system_status)
+
+    # departments, create-department, delete-department
+    p_depts = subparsers.add_parser("departments", help="List/check departments")
+    p_depts.add_argument("--name", help="Filter by name")
+    add_list_args(p_depts)
+    p_depts.set_defaults(func=cmd_departments)
+
+    p_create_dept = subparsers.add_parser("create-department", help="Create department")
+    p_create_dept.add_argument("--name", required=True)
+    p_create_dept.add_argument("--language", default="EN")
+    p_create_dept.add_argument("--prompt-set", required=True)
+    p_create_dept.add_argument("--timezone", default="51")
+    p_create_dept.add_argument("--sys-from", default="300")
+    p_create_dept.add_argument("--sys-to", default="319")
+    p_create_dept.add_argument("--trunk-from", default="340")
+    p_create_dept.add_argument("--trunk-to", default="345")
+    p_create_dept.add_argument("--user-from", default="320")
+    p_create_dept.add_argument("--user-to", default="339")
+    p_create_dept.set_defaults(func=cmd_create_department)
+
+    p_del_dept = subparsers.add_parser("delete-department", help="Delete department")
+    p_del_dept.add_argument("--id", type=int, required=True)
+    p_del_dept.set_defaults(func=cmd_delete_department)
+
+    p_update_dept = subparsers.add_parser("update-department", help="Update department settings")
+    p_update_dept.add_argument("--id", type=int, required=True, help="Department ID")
+    p_update_dept.add_argument("--transcription", choices=["Both", "Nothing", "Inherit"], help="Transcription mode")
+    p_update_dept.set_defaults(func=cmd_update_department)
+
+    # users, create-user, delete-users, assign-role
+    p_users = subparsers.add_parser("users", help="List users")
+    p_users.add_argument("--email", help="Filter by email")
+    add_list_args(p_users)
+    p_users.set_defaults(func=cmd_users)
+
+    p_create_user = subparsers.add_parser("create-user", help="Create user")
+    p_create_user.add_argument("--first-name", required=True)
+    p_create_user.add_argument("--last-name", required=True)
+    p_create_user.add_argument("--email", required=True)
+    p_create_user.add_argument("--password", required=True)
+    p_create_user.add_argument("--extension", required=True)
+    p_create_user.add_argument("--language", default="EN")
+    p_create_user.add_argument("--prompt-set", required=True)
+    p_create_user.set_defaults(func=cmd_create_user)
+
+    p_del_users = subparsers.add_parser("delete-users", help="Delete users")
+    p_del_users.add_argument("--ids", type=int, nargs="+", required=True)
+    p_del_users.set_defaults(func=cmd_delete_users)
+
+    p_role = subparsers.add_parser("assign-role", help="Assign role to user")
+    p_role.add_argument("--user-id", type=int, required=True)
+    p_role.add_argument("--group-id", type=int, required=True)
+    p_role.add_argument("--role", required=True, choices=["system_owners", "system_admins", "group_owners", "managers", "group_admins", "receptionists", "users"])
+    p_role.set_defaults(func=cmd_assign_role)
+
+    # live-chat, create-live-chat
+    p_chat = subparsers.add_parser("live-chat", help="List live chat URLs")
+    p_chat.add_argument("--check", help="Check if URL exists")
+    add_list_args(p_chat)
+    p_chat.set_defaults(func=cmd_live_chat)
+
+    p_create_chat = subparsers.add_parser("create-live-chat", help="Create live chat URL")
+    p_create_chat.add_argument("--link", required=True)
+    p_create_chat.add_argument("--group-id", type=int, required=True)
+    p_create_chat.add_argument("--group-name", required=True)
+    p_create_chat.add_argument("--group-number", required=True)
+    p_create_chat.set_defaults(func=cmd_create_live_chat)
+
+    # parking
+    p_parking = subparsers.add_parser("parking", help="Manage shared parking")
+    p_parking.add_argument("--create", action="store_true")
+    p_parking.add_argument("--delete", type=int, help="Parking ID to delete")
+    p_parking.add_argument("--group-ids", type=int, nargs="+")
+    add_list_args(p_parking)
+    p_parking.set_defaults(func=cmd_parking)
+
+    # active-calls, call-history, recordings (Tier 1)
+    p_calls = subparsers.add_parser("active-calls", help="List active calls or drop a call")
+    p_calls.add_argument("--drop", type=int, help="Call ID to drop")
+    add_list_args(p_calls)
+    p_calls.set_defaults(func=cmd_active_calls)
+
+    p_history = subparsers.add_parser("call-history", help="View call history")
+    p_history.add_argument("--start", type=str, help="Start date (ISO 8601, e.g. 2026-01-01T00:00:00Z)")
+    p_history.add_argument("--end", type=str, help="End date (ISO 8601)")
+    add_list_args(p_history)
+    p_history.set_defaults(func=cmd_call_history)
+
+    p_rec = subparsers.add_parser("recordings", help="Manage call recordings")
+    p_rec.add_argument("--download", type=int, help="Recording ID to download")
+    p_rec.add_argument("--delete", type=int, nargs="+", help="Recording IDs to delete")
+    add_list_args(p_rec)
+    p_rec.set_defaults(func=cmd_recordings)
+
+    # inbound-rules, outbound-rules, ivrs, queues, ring-groups (Tier 2)
+    p_inbound = subparsers.add_parser("inbound-rules", help="Manage inbound rules")
+    p_inbound.add_argument("--id", type=int, help="Rule ID to retrieve")
+    p_inbound.add_argument("--delete", type=int, nargs="+", help="Rule IDs to delete")
+    add_list_args(p_inbound)
+    p_inbound.set_defaults(func=cmd_inbound_rules)
+
+    p_outbound = subparsers.add_parser("outbound-rules", help="Manage outbound rules")
+    p_outbound.add_argument("--id", type=int, help="Rule ID to retrieve")
+    p_outbound.add_argument("--delete", type=int, nargs="+", help="Rule IDs to delete")
+    add_list_args(p_outbound)
+    p_outbound.set_defaults(func=cmd_outbound_rules)
+
+    p_ivrs = subparsers.add_parser("ivrs", help="List/get IVRs")
+    p_ivrs.add_argument("--id", type=int, help="IVR ID to retrieve")
+    add_list_args(p_ivrs)
+    p_ivrs.set_defaults(func=cmd_ivrs)
+
+    p_queues = subparsers.add_parser("queues", help="List/get queues")
+    p_queues.add_argument("--id", type=int, help="Queue ID to retrieve")
+    add_list_args(p_queues)
+    p_queues.set_defaults(func=cmd_queues)
+
+    p_rgroups = subparsers.add_parser("ring-groups", help="List/get ring groups")
+    p_rgroups.add_argument("--id", type=int, help="Ring group ID to retrieve")
+    add_list_args(p_rgroups)
+    p_rgroups.set_defaults(func=cmd_ring_groups)
+
+    # trunks, phones, contacts (Tier 3)
+    p_trunks = subparsers.add_parser("trunks", help="Manage SIP trunks")
+    p_trunks.add_argument("--id", type=int, help="Trunk ID to retrieve")
+    p_trunks.add_argument("--delete", type=int, nargs="+", help="Trunk IDs to delete")
+    add_list_args(p_trunks)
+    p_trunks.set_defaults(func=cmd_trunks)
+
+    p_phones = subparsers.add_parser("phones", help="Manage phones")
+    p_phones.add_argument("--id", type=int, help="Phone ID to retrieve")
+    p_phones.add_argument("--delete", type=int, nargs="+", help="Phone IDs to delete")
+    add_list_args(p_phones)
+    p_phones.set_defaults(func=cmd_phones)
+
+    p_contacts = subparsers.add_parser("contacts", help="Manage contacts")
+    p_contacts.add_argument("--id", type=int, help="Contact ID to retrieve")
+    p_contacts.add_argument("--delete", type=int, nargs="+", help="Contact IDs to delete")
+    p_contacts.add_argument("--export", action="store_true", help="Export contacts to CSV")
+    add_list_args(p_contacts)
+    p_contacts.set_defaults(func=cmd_contacts)
+
+    # blacklist, ip-blocklist, activity-log (Tier 4)
+    p_blacklist = subparsers.add_parser("blacklist", help="Manage blacklisted numbers")
+    p_blacklist.add_argument("--add", type=str, help="Phone number to blacklist")
+    p_blacklist.add_argument("--delete", type=int, nargs="+", help="Blacklist entry IDs to delete")
+    add_list_args(p_blacklist)
+    p_blacklist.set_defaults(func=cmd_blacklist)
+
+    p_ipblock = subparsers.add_parser("ip-blocklist", help="Manage IP blocklist")
+    p_ipblock.add_argument("--add", type=str, help="IP address to block")
+    p_ipblock.add_argument("--description", type=str, help="Description for blocked IP")
+    p_ipblock.add_argument("--delete", type=int, nargs="+", help="Blocklist entry IDs to delete")
+    add_list_args(p_ipblock)
+    p_ipblock.set_defaults(func=cmd_ip_blocklist)
+
+    p_actlog = subparsers.add_parser("activity-log", help="View or purge activity log")
+    p_actlog.add_argument("--purge", action="store_true", help="Purge all logs")
+    p_actlog.add_argument("--start", type=str, help="Start date (ISO 8601, e.g. 2026-01-01T00:00:00Z)")
+    p_actlog.add_argument("--end", type=str, help="End date (ISO 8601)")
+    p_actlog.add_argument("--extension", type=str, help="Filter by extension")
+    p_actlog.add_argument("--call-id", type=str, help="Filter by call ID")
+    p_actlog.add_argument("--severity", type=str, help="Filter by severity")
+    add_list_args(p_actlog)
+    p_actlog.set_defaults(func=cmd_activity_log)
+
+    # backups, restart, emergency-numbers (Tier 5)
+    p_backups = subparsers.add_parser("backups", help="Manage backups")
+    p_backups.add_argument("--create", action="store_true", help="Create a new backup")
+    p_backups.add_argument("--restore", type=str, help="Backup filename to restore")
+    add_list_args(p_backups)
+    p_backups.set_defaults(func=cmd_backups)
+
+    p_restart = subparsers.add_parser("restart", help="Restart the PBX")
+    p_restart.add_argument("--confirm", action="store_true", help="Confirm PBX restart")
+    p_restart.set_defaults(func=cmd_restart)
+
+    p_emergency = subparsers.add_parser("emergency-numbers", help="Manage emergency numbers")
+    p_emergency.add_argument("--add", type=str, help="Emergency number to add")
+    p_emergency.add_argument("--name", type=str, help="Name for emergency number")
+    p_emergency.add_argument("--delete", type=int, nargs="+", help="Emergency number IDs to delete")
+    add_list_args(p_emergency)
+    p_emergency.set_defaults(func=cmd_emergency_numbers)
+
+    args = parser.parse_args()
+    if args.command != "config" and not os.environ.get("THREECX_FQDN") and not os.path.exists(CONFIG_FILE):
+        print("Error: Set THREECX_FQDN env var or run 'config' command first", file=sys.stderr)
+        sys.exit(1)
+    args.func(args)
+
+if __name__ == "__main__":
+    main()

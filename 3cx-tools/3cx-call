@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""3CX Call Control API CLI Tool"""
+
+import argparse
+import json
+import os
+import sys
+import requests
+import websocket
+import threading
+import time
+
+CONFIG_FILE = os.environ.get("THREECX_CALL_CONFIG_FILE", os.path.expanduser("~/.3cx-call.json"))
+
+def load_config():
+    """Load config from environment variables, falling back to config file."""
+    fqdn = os.environ.get("THREECX_FQDN", "")
+    if fqdn:
+        return {
+            "fqdn": fqdn,
+            "api_key": os.environ.get("THREECX_API_KEY", ""),
+            "dn": os.environ.get("THREECX_DN", "100"),
+        }
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_config(config):
+    """Save config to file (only when not using env vars)."""
+    if os.environ.get("THREECX_FQDN"):
+        return
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
+
+def get_token(config):
+    """Exchange API key for JWT via OAuth2 token endpoint."""
+    now = time.time()
+    if config.get("access_token") and config.get("token_expiry", 0) > now + 5:
+        return config["access_token"]
+    url = f"https://{config['fqdn']}/connect/token"
+    data = {
+        "client_id": config["dn"],
+        "client_secret": config["api_key"],
+        "grant_type": "client_credentials"
+    }
+    resp = requests.post(url, data=data)
+    resp.raise_for_status()
+    token_data = resp.json()
+    config["access_token"] = token_data["access_token"]
+    config["token_expiry"] = now + token_data.get("expires_in", 60)
+    save_config(config)
+    return config["access_token"]
+
+def get_headers(config):
+    token = get_token(config)
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def api_url(config, path=""):
+    base = f"https://{config['fqdn']}/callcontrol"
+    if path:
+        return f"{base}/{path}"
+    return base
+
+def ws_url(config):
+    return f"wss://{config['fqdn']}/callcontrol/ws"
+
+def handle_response(resp, verbose=False):
+    """Unified response handler with 401 detail message."""
+    if resp.status_code == 401:
+        print("Error 401: Invalid API key. Create one in 3CX Admin Console > Integrations > API", file=sys.stderr)
+        print("Make sure '3CX Call Control API Access' is checked for your application.", file=sys.stderr)
+        sys.exit(1)
+    if resp.status_code >= 400:
+        print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    if resp.text:
+        try:
+            print(json.dumps(resp.json(), indent=2))
+        except (json.JSONDecodeError, requests.exceptions.JSONDecodeError):
+            print(resp.text)
+    else:
+        print(json.dumps({"status": resp.status_code}, indent=2))
+
+def verbose_request(method, url, verbose=False, **kwargs):
+    """Wrapper around requests that prints URL/method when verbose."""
+    if verbose:
+        print(f"[{method.upper()}] {url}", file=sys.stderr)
+    return getattr(requests, method)(url, **kwargs)
+
+def cmd_config(args):
+    fqdn = args.fqdn.replace("https://", "").replace("http://", "").strip("/")
+    config = {
+        "fqdn": fqdn,
+        "api_key": args.api_key,
+        "dn": args.dn
+    }
+    save_config(config)
+    print("Configuration saved.")
+
+def cmd_status(args):
+    config = load_config()
+    headers = get_headers(config)
+    dn = args.dn or config.get("dn", "")
+    url = api_url(config, dn) if dn else api_url(config)
+    resp = verbose_request("get", url, verbose=args.verbose, headers=headers)
+    handle_response(resp)
+
+def cmd_devices(args):
+    config = load_config()
+    headers = get_headers(config)
+    dn = args.dn or config.get("dn", "")
+    if args.device_id:
+        url = api_url(config, f"{dn}/devices/{args.device_id}")
+    else:
+        url = api_url(config, f"{dn}/devices")
+    resp = verbose_request("get", url, verbose=args.verbose, headers=headers)
+    handle_response(resp)
+
+def cmd_make_call(args):
+    config = load_config()
+    headers = get_headers(config)
+    dn = args.dn or config.get("dn", "")
+    data = {"destination": args.destination, "timeout": args.timeout}
+    if args.attached_data:
+        data["attacheddata"] = json.loads(args.attached_data)
+    if args.device_id:
+        url = api_url(config, f"{dn}/devices/{args.device_id}/makecall")
+    else:
+        url = api_url(config, f"{dn}/makecall")
+    resp = verbose_request("post", url, verbose=args.verbose, headers=headers, json=data)
+    handle_response(resp)
+
+def cmd_participant(args):
+    config = load_config()
+    headers = get_headers(config)
+    dn = args.dn or config.get("dn", "")
+    if args.participant_id:
+        url = api_url(config, f"{dn}/participants/{args.participant_id}")
+    else:
+        url = api_url(config, f"{dn}/participants")
+    resp = verbose_request("get", url, verbose=args.verbose, headers=headers)
+    handle_response(resp)
+
+def cmd_action(args):
+    config = load_config()
+    headers = get_headers(config)
+    dn = args.dn or config.get("dn", "")
+    url = api_url(config, f"{dn}/participants/{args.participant_id}/{args.action}")
+    data = {}
+    if args.destination:
+        data["destination"] = args.destination
+    if args.reason:
+        data["reason"] = args.reason
+    if args.timeout:
+        data["timeout"] = args.timeout
+    if args.attached_data:
+        data["attacheddata"] = json.loads(args.attached_data)
+    resp = verbose_request("post", url, verbose=args.verbose, headers=headers, json=data if data else None)
+    handle_response(resp)
+
+def cmd_listen(args):
+    config = load_config()
+    dn = args.dn or config.get("dn", "")
+    ws_url_str = ws_url(config)
+    max_retries = args.retries
+    attempt = 0
+
+    while attempt <= max_retries:
+        connected = threading.Event()
+        should_reconnect = threading.Event()
+        should_reconnect.set()  # default to reconnect on unexpected close
+
+        def on_message(ws, message):
+            data = json.loads(message)
+            event_type = data.get("EventType")
+            if event_type == 0:
+                print(f"[UPSERT] {data.get('Entity')}")
+                if data.get("AttachedData"):
+                    print(json.dumps(data.get("AttachedData"), indent=2))
+            elif event_type == 1:
+                print(f"[REMOVE] {data.get('Entity')}")
+            elif event_type == 2:
+                attached = data.get("AttachedData", {})
+                print(f"[DTMF] {attached.get('Response', {}).get('dtmf', '')}")
+            elif event_type == 4:
+                print(f"[RESPONSE] {json.dumps(data.get('AttachedData', {}), indent=2)}")
+            else:
+                print(f"[EVENT] {json.dumps(data, indent=2)}")
+
+        def on_error(ws, error):
+            print(f"WebSocket error: {error}", file=sys.stderr)
+
+        def on_open(ws):
+            nonlocal attempt
+            attempt = 0  # reset on successful connection
+            connected.set()
+            if args.verbose:
+                print(f"[WS] Connected to {ws_url_str}", file=sys.stderr)
+            sub_msg = {"RequestId": int(time.time()), "Path": f"/callcontrol/{dn}", "RequestData": {"subscribe": True}}
+            ws.send(json.dumps(sub_msg))
+            print(f"Subscribed to /callcontrol/{dn}. Press Ctrl+C to stop.")
+
+        def on_close(ws, close_status_code, close_msg):
+            print("Connection closed", file=sys.stderr)
+
+        ws = websocket.WebSocketApp(
+            ws_url_str,
+            header=[f"Authorization: Bearer {get_token(config)}"],
+            on_message=on_message,
+            on_error=on_error,
+            on_open=on_open,
+            on_close=on_close
+        )
+
+        ws_thread = threading.Thread(target=ws.run_forever)
+        ws_thread.daemon = True
+        ws_thread.start()
+
+        try:
+            while ws_thread.is_alive():
+                ws_thread.join(timeout=1)
+        except KeyboardInterrupt:
+            print("\nStopping...", file=sys.stderr)
+            should_reconnect.clear()
+            ws.close()
+            return
+
+        if not should_reconnect.is_set():
+            return
+
+        attempt += 1
+        if attempt <= max_retries:
+            delay = min(2 ** attempt, 60)
+            print(f"Reconnecting in {delay}s (attempt {attempt}/{max_retries})...", file=sys.stderr)
+            try:
+                time.sleep(delay)
+            except KeyboardInterrupt:
+                print("\nStopping...", file=sys.stderr)
+                return
+
+    print(f"Max retries ({max_retries}) exceeded. Giving up.", file=sys.stderr)
+    sys.exit(1)
+
+def cmd_stream(args):
+    config = load_config()
+    headers = get_headers(config)
+    dn = args.dn or config.get("dn", "")
+    url = api_url(config, f"{dn}/participants/{args.participant_id}/stream")
+    stream_headers = {k: v for k, v in headers.items() if k != "Content-Type"}
+
+    if args.upload:
+        with open(args.upload, "rb") as f:
+            audio_data = f.read()
+        resp = verbose_request("post", url, verbose=args.verbose, headers=stream_headers, data=audio_data)
+        if resp.status_code >= 400:
+            handle_response(resp)
+        print(f"Stream uploaded: {resp.status_code}")
+    else:
+        resp = verbose_request("get", url, verbose=args.verbose, headers=stream_headers)
+        if resp.status_code >= 400:
+            handle_response(resp)
+        if args.output:
+            with open(args.output, "wb") as f:
+                f.write(resp.content)
+            print(f"Stream saved to {args.output}")
+        else:
+            print(f"Stream received: {len(resp.content)} bytes")
+
+def main():
+    parser = argparse.ArgumentParser(description="3CX Call Control API CLI")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Print request URL/method for debugging")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_config = subparsers.add_parser("config", help="Save API credentials")
+    p_config.add_argument("--fqdn", required=True, help="PBX FQDN")
+    p_config.add_argument("--api-key", required=True, help="API Key")
+    p_config.add_argument("--dn", required=True, help="Default DN (extension)")
+    p_config.set_defaults(func=cmd_config)
+
+    p_status = subparsers.add_parser("status", help="Get call control status")
+    p_status.add_argument("--dn", help="DN (uses default if not specified)")
+    p_status.set_defaults(func=cmd_status)
+
+    p_devices = subparsers.add_parser("devices", help="List/get devices")
+    p_devices.add_argument("--dn", help="DN (uses default if not specified)")
+    p_devices.add_argument("--device-id", help="Get specific device")
+    p_devices.set_defaults(func=cmd_devices)
+
+    p_makecall = subparsers.add_parser("call", help="Make a call")
+    p_makecall.add_argument("--destination", required=True, help="Destination number")
+    p_makecall.add_argument("--timeout", type=int, default=30, help="Call timeout in seconds")
+    p_makecall.add_argument("--device-id", help="Call from specific device")
+    p_makecall.add_argument("--attached-data", help="JSON attached data")
+    p_makecall.add_argument("--dn", help="DN (uses default if not specified)")
+    p_makecall.set_defaults(func=cmd_make_call)
+
+    p_participant = subparsers.add_parser("participant", help="Get participant(s)")
+    p_participant.add_argument("--dn", help="DN (uses default if not specified)")
+    p_participant.add_argument("--participant-id", type=int, help="Specific participant ID")
+    p_participant.set_defaults(func=cmd_participant)
+
+    p_action = subparsers.add_parser("action", help="Perform action on participant")
+    p_action.add_argument("--participant-id", type=int, required=True)
+    p_action.add_argument("--action", required=True, choices=["drop", "answer", "divert", "routeto", "transferto", "attach_participant_data", "attach_party_data"])
+    p_action.add_argument("--destination", help="Destination for divert/routeto/transferto")
+    p_action.add_argument("--reason", help="Reason for action")
+    p_action.add_argument("--timeout", type=int, help="Timeout for action")
+    p_action.add_argument("--attached-data", help="JSON attached data")
+    p_action.add_argument("--dn", help="DN (uses default if not specified)")
+    p_action.set_defaults(func=cmd_action)
+
+    p_listen = subparsers.add_parser("listen", help="Listen for real-time events via WebSocket")
+    p_listen.add_argument("--dn", help="DN (uses default if not specified)")
+    p_listen.add_argument("--retries", type=int, default=5, help="Max reconnection attempts (default: 5)")
+    p_listen.set_defaults(func=cmd_listen)
+
+    p_stream = subparsers.add_parser("stream", help="Get/upload audio stream")
+    p_stream.add_argument("--participant-id", type=int, required=True)
+    p_stream.add_argument("--upload", help="Upload audio file (PCM 16-bit 8000Hz mono)")
+    p_stream.add_argument("--output", help="Save stream to file")
+    p_stream.add_argument("--dn", help="DN (uses default if not specified)")
+    p_stream.set_defaults(func=cmd_stream)
+
+    args = parser.parse_args()
+    if args.command != "config" and not os.environ.get("THREECX_FQDN") and not os.path.exists(CONFIG_FILE):
+        print("Error: Set THREECX_FQDN env var or run 'config' command first", file=sys.stderr)
+        sys.exit(1)
+    args.func(args)
+
+if __name__ == "__main__":
+    main()

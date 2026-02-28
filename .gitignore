@@ -1,5 +1,7 @@
 # Environment (may contain secrets)
 .env
+.3cx-config.json
+.3cx-call.json
 
 # Python
 __pycache__/
@@ -20,6 +22,10 @@ bun.lock
 
 # Plans (local working notes)
 Plans/
+
+# Playwright test artifacts
+.playwright-cli/
+test-results/
 
 # Test artifacts
 *.wav

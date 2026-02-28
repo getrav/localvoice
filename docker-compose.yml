@@ -9,19 +9,22 @@ services:
     volumes:
       - whisper-models:/models
     environment:
-      - WHISPER_MODEL=${WHISPER_MODEL:-small}
+      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
       - DEVICE=${WHISPER_DEVICE:-vulkan}
       - COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-int8}
       - OMP_NUM_THREADS=${WHISPER_THREADS:-4}
       - MODEL_CACHE_DIR=/models
       - STT_BACKEND_URL=http://whispercpp-backend:8081/inference
+      - STT_BACKEND_EN_URL=http://whispercpp-backend-en:8082/inference
+      - STT_MODEL_EN=${WHISPER_MODEL_EN:-small.en}
       - STT_BACKEND_TIMEOUT=300
     depends_on:
       - whispercpp-backend
+      - whispercpp-backend-en
     deploy:
       resources:
         limits:
-          memory: 1g
+          memory: 2g
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -39,7 +42,7 @@ services:
     devices:
       - "/dev/dri:/dev/dri"
     environment:
-      - WHISPER_MODEL=${WHISPER_MODEL:-small}
+      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
       - WHISPER_THREADS=${WHISPER_THREADS:-4}
     command:
       - --host
@@ -49,7 +52,32 @@ services:
       - --inference-path
       - /inference
       - -m
-      - /models/ggml-${WHISPER_MODEL:-small}.bin
+      - /models/ggml-${WHISPER_MODEL:-medium}.bin
+      - -t
+      - "${WHISPER_THREADS:-4}"
+      - --convert
+    restart: unless-stopped
+
+  whispercpp-backend-en:
+    image: ghcr.io/ggml-org/whisper.cpp:main-vulkan
+    container_name: localvoice-whispercpp-backend-en
+    entrypoint: ["whisper-server"]
+    volumes:
+      - whisper-models:/models
+    devices:
+      - "/dev/dri:/dev/dri"
+    environment:
+      - WHISPER_MODEL_EN=${WHISPER_MODEL_EN:-small.en}
+      - WHISPER_THREADS=${WHISPER_THREADS:-4}
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8082"
+      - --inference-path
+      - /inference
+      - -m
+      - /models/ggml-${WHISPER_MODEL_EN:-small.en}.bin
       - -t
       - "${WHISPER_THREADS:-4}"
       - --convert
@@ -111,7 +139,72 @@ services:
       start_period: 300s
       retries: 3
 
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: localvoice-web
+    ports:
+      - "0.0.0.0:7001:7001"
+    volumes:
+      - 3cx-data:/data:ro
+    environment:
+      - PORT=7001
+      - THREECX_FQDN=${THREECX_FQDN:-}
+      - THREECX_CLIENT_ID=${THREECX_CLIENT_ID:-}
+      - THREECX_CLIENT_SECRET=${THREECX_CLIENT_SECRET:-}
+      - LOCALVOICE_STT_URL=http://whisper-stt:8080
+      - LOCALVOICE_PIPER_URL=http://piper-tts:8000
+      - LOCALVOICE_PARLER_URL=http://parler-tts:8001
+      - DB_PATH=/data/3cx.db3
+      - RECORDINGS_DIR=/data/recordings
+    depends_on:
+      - whisper-stt
+      - piper-tts
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7001/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  3cx-sync:
+    build:
+      context: ./3cx-sync
+      dockerfile: Dockerfile
+    container_name: localvoice-3cx-sync
+    volumes:
+      - 3cx-data:/data
+    environment:
+      - THREECX_FQDN=${THREECX_FQDN:-}
+      - THREECX_CLIENT_ID=${THREECX_CLIENT_ID:-}
+      - THREECX_CLIENT_SECRET=${THREECX_CLIENT_SECRET:-}
+      - LOCALVOICE_STT_URL=http://whisper-stt:8080
+      - DB_PATH=/data/3cx.db3
+      - RECORDINGS_DIR=/data/recordings
+      - SYNC_CRON_SCHEDULE=${SYNC_CRON_SCHEDULE:-*/15 * * * *}
+      - SYNC_ON_START=${SYNC_ON_START:-false}
+    depends_on:
+      - whisper-stt
+    restart: unless-stopped
+
+  3cx-tools:
+    build:
+      context: ./3cx-tools
+      dockerfile: Dockerfile
+    container_name: localvoice-3cx-tools
+    profiles:
+      - 3cx-cli
+    environment:
+      - THREECX_FQDN=${THREECX_FQDN:-}
+      - THREECX_CLIENT_ID=${THREECX_CLIENT_ID:-}
+      - THREECX_CLIENT_SECRET=${THREECX_CLIENT_SECRET:-}
+      - THREECX_API_KEY=${THREECX_API_KEY:-}
+      - THREECX_DN=${THREECX_DN:-100}
+
 volumes:
   whisper-models:
   piper-models:
   parler-models:
+  3cx-data:
