@@ -4,6 +4,15 @@ set -e
 # Create data directories
 mkdir -p /data/recordings
 
+missing_env=()
+[ -z "${THREECX_FQDN:-}" ] && missing_env+=("THREECX_FQDN")
+[ -z "${THREECX_CLIENT_ID:-}" ] && missing_env+=("THREECX_CLIENT_ID")
+[ -z "${THREECX_CLIENT_SECRET:-}" ] && missing_env+=("THREECX_CLIENT_SECRET")
+if [ "${#missing_env[@]}" -ne 0 ]; then
+    echo "[3cx-sync] Missing required env var(s): ${missing_env[*]}" >&2
+    exit 2
+fi
+
 CONFIG_FILE="/data/sync-config.json"
 DEFAULT_INTERVAL=5
 

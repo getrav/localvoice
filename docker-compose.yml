@@ -1,87 +1,31 @@
 services:
   whisper-stt:
-    build:
-      context: ./whisper-stt
-      dockerfile: Dockerfile
+    image: fedirz/faster-whisper-server:latest-cuda
     container_name: localvoice-whisper-stt
     ports:
-      - "0.0.0.0:8080:8080"
+      - "0.0.0.0:8080:8000"
     volumes:
       - whisper-models:/models
     environment:
-      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
-      - DEVICE=${WHISPER_DEVICE:-vulkan}
-      - COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-int8}
-      - OMP_NUM_THREADS=${WHISPER_THREADS:-4}
-      - MODEL_CACHE_DIR=/models
-      - STT_BACKEND_URL=http://whispercpp-backend:8081/inference
-      - STT_BACKEND_EN_URL=http://whispercpp-backend-en:8082/inference
-      - STT_MODEL_EN=${WHISPER_MODEL_EN:-small.en}
-      - STT_BACKEND_TIMEOUT=300
-    depends_on:
-      - whispercpp-backend
-      - whispercpp-backend-en
+      - WHISPER__MODEL=Systran/faster-whisper-large-v3
+      - WHISPER__INFERENCE_DEVICE=cuda
+      - WHISPER__COMPUTE_TYPE=float16
+      - WHISPER__BATCH_SIZE=16
+      - WHISPER__VAD_FILTER=true
     deploy:
       resources:
-        limits:
-          memory: 2g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       start_period: 120s
       retries: 3
-
-  whispercpp-backend:
-    image: ghcr.io/ggml-org/whisper.cpp:main-vulkan
-    container_name: localvoice-whispercpp-backend
-    entrypoint: ["whisper-server"]
-    volumes:
-      - whisper-models:/models
-    devices:
-      - "/dev/dri:/dev/dri"
-    environment:
-      - WHISPER_MODEL=${WHISPER_MODEL:-medium}
-      - WHISPER_THREADS=${WHISPER_THREADS:-4}
-    command:
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8081"
-      - --inference-path
-      - /inference
-      - -m
-      - /models/ggml-${WHISPER_MODEL:-medium}.bin
-      - -t
-      - "${WHISPER_THREADS:-4}"
-      - --convert
-    restart: unless-stopped
-
-  whispercpp-backend-en:
-    image: ghcr.io/ggml-org/whisper.cpp:main-vulkan
-    container_name: localvoice-whispercpp-backend-en
-    entrypoint: ["whisper-server"]
-    volumes:
-      - whisper-models:/models
-    devices:
-      - "/dev/dri:/dev/dri"
-    environment:
-      - WHISPER_MODEL_EN=${WHISPER_MODEL_EN:-small.en}
-      - WHISPER_THREADS=${WHISPER_THREADS:-4}
-    command:
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8082"
-      - --inference-path
-      - /inference
-      - -m
-      - /models/ggml-${WHISPER_MODEL_EN:-small.en}.bin
-      - -t
-      - "${WHISPER_THREADS:-4}"
-      - --convert
-    restart: unless-stopped
 
   piper-tts:
     build:
@@ -121,7 +65,7 @@ services:
     environment:
       - MODEL_NAME=${PARLER_MODEL:-parler-tts/parler_tts_mini_v0.1}
       - MODEL_CACHE_DIR=/models
-      - DEVICE=cpu
+      - DEVICE=${PARLER_DEVICE:-cuda}
       - SAMPLE_RATE=24000
       - TTS_DESCRIPTION=${PARLER_DESCRIPTION:-A female speaker delivers a slightly expressive and animated speech.}
       - OMP_NUM_THREADS=${PARLER_THREADS:-6}
@@ -129,8 +73,11 @@ services:
       - OPENBLAS_NUM_THREADS=${PARLER_THREADS:-6}
     deploy:
       resources:
-        limits:
-          memory: 4g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
@@ -153,7 +100,7 @@ services:
       - THREECX_FQDN=${THREECX_FQDN:-}
       - THREECX_CLIENT_ID=${THREECX_CLIENT_ID:-}
       - THREECX_CLIENT_SECRET=${THREECX_CLIENT_SECRET:-}
-      - LOCALVOICE_STT_URL=http://whisper-stt:8080
+      - LOCALVOICE_STT_URL=http://whisper-stt:8000
       - LOCALVOICE_PIPER_URL=http://piper-tts:8000
       - LOCALVOICE_PARLER_URL=http://parler-tts:8001
       - LOCALVOICE_KOKORO_URL=http://kokoro-tts:8880
@@ -172,14 +119,17 @@ services:
       retries: 3
 
   kokoro-tts:
-    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
     container_name: localvoice-kokoro-tts
     ports:
       - "8880:8880"
     deploy:
       resources:
-        limits:
-          memory: 2g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8880/health"]
@@ -201,13 +151,17 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
       - OMP_NUM_THREADS=${DIAR_THREADS:-4}
       - MKL_NUM_THREADS=${DIAR_THREADS:-4}
+      - DEVICE=${DIAR_DEVICE:-cuda}
       - PORT=8090
       - DB_PATH=/data/voices.db3
       - ENROLLMENTS_DIR=/data/enrollments
     deploy:
       resources:
-        limits:
-          memory: 4g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
@@ -227,7 +181,7 @@ services:
       - THREECX_FQDN=${THREECX_FQDN:-}
       - THREECX_CLIENT_ID=${THREECX_CLIENT_ID:-}
       - THREECX_CLIENT_SECRET=${THREECX_CLIENT_SECRET:-}
-      - LOCALVOICE_STT_URL=http://whisper-stt:8080
+      - LOCALVOICE_STT_URL=http://whisper-stt:8000
       - LOCALVOICE_DIAR_URL=http://diarization:8090
       - DB_PATH=/data/3cx.db3
       - RECORDINGS_DIR=/data/recordings

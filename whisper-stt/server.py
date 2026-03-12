@@ -5,7 +5,7 @@ import logging
 from typing import Optional
 
 import httpx
-from aksharamukha import transliterate as aksha
+from indic_transliteration import sanscript
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -78,7 +78,7 @@ def transliterate_text(text):
     """Convert Devanagari characters to readable Latin script."""
     if not text or not any('\u0900' <= c <= '\u097F' for c in text):
         return text
-    return aksha.process('Devanagari', 'RomanColloquial', text)
+    return sanscript.transliterate(text, sanscript.DEVANAGARI, sanscript.ITRANS)
 
 
 def _route_model(model: str) -> tuple[httpx.AsyncClient, str]:

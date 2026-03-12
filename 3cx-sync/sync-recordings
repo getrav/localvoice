@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -12,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 import requests
-from aksharamukha import transliterate as aksha
+from indic_transliteration import sanscript
 
 # -- Auth (env-var based for Docker) -------------------------------------------
 
@@ -112,6 +113,7 @@ def init_db():
         "ALTER TABLE recordings ADD COLUMN sync_status_diar TEXT DEFAULT 'pending'",
         "ALTER TABLE recordings ADD COLUMN call_log_json TEXT",
         "ALTER TABLE recordings ADD COLUMN call_log_synced INTEGER DEFAULT 0",
+        "ALTER TABLE recordings ADD COLUMN processing_step TEXT",
     ]
     for sql in migrations:
         try:
@@ -127,7 +129,7 @@ def transliterate_text(text):
     """Convert any Devanagari characters in text to readable Latin script."""
     if not text or not any('\u0900' <= c <= '\u097F' for c in text):
         return text  # No Devanagari, skip
-    return aksha.process('Devanagari', 'RomanColloquial', text)
+    return sanscript.transliterate(text, sanscript.DEVANAGARI, sanscript.ITRANS)
 
 def resolve_audio_file(opus_path, wav_path):
     """Return (abs_path, mime_type) preferring opus over WAV, or (None, None)."""
@@ -235,8 +237,39 @@ DN_TYPE_LABELS = {
     6: "IVR", 7: "Fax", 8: "Parking", 16: "Group",
 }
 
+def normalize_number(num):
+    """Strip non-digit chars, keep last 10 digits for comparison."""
+    if not num:
+        return ""
+    digits = re.sub(r'\D', '', str(num))
+    return digits[-10:] if len(digits) >= 10 else digits
+
+def numbers_match(a, b):
+    """Check if two normalized numbers match (exact or last-7-digit suffix)."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # Suffix match for shorter numbers (extensions, local numbers)
+    min_len = min(len(a), len(b))
+    suffix = min(7, min_len)
+    return suffix >= 3 and a[-suffix:] == b[-suffix:]
+
 def fetch_call_logs(config, db):
     """Fetch call log data from 3CX for recordings that don't have it yet."""
+    # Reset previously failed syncs (marked synced but no data) so they get retried
+    reset_count = db.execute(
+        "SELECT COUNT(*) FROM recordings "
+        "WHERE call_log_synced=1 AND call_log_json IS NULL"
+    ).fetchone()[0]
+    if reset_count > 0:
+        db.execute(
+            "UPDATE recordings SET call_log_synced=0 "
+            "WHERE call_log_synced=1 AND call_log_json IS NULL"
+        )
+        db.commit()
+        print(f"  Reset {reset_count} recordings for call log retry (previously unmatched)")
+
     rows = db.execute(
         "SELECT id, start_time, end_time, from_caller_number, to_caller_number "
         "FROM recordings WHERE (call_log_synced = 0 OR call_log_synced IS NULL) "
@@ -265,19 +298,25 @@ def fetch_call_logs(config, db):
     matched = 0
     for date_key, recs in sorted(by_date.items()):
         try:
-            # Query call logs for this entire day
-            period_from = f"{date_key}T00:00:00"
-            period_to = f"{date_key}T23:59:59"
+            # Query call logs for this entire day (OData bound function with all required params)
+            period_from = f"{date_key}T00:00:00Z"
+            period_to = f"{date_key}T23:59:59Z"
             headers = get_headers(config)
 
-            url = api_url(config, "ReportCallLogData/Pbx.GetCallLogData()")
-            params = {
-                "periodFrom": period_from,
-                "periodTo": period_to,
-                "$top": "1000",
-                "$orderby": "StartTime",
-            }
-            resp = requests.get(url, headers=headers, params=params)
+            odata_fn = (
+                f"ReportCallLogData/Pbx.GetCallLogData("
+                f"periodFrom={period_from},"
+                f"periodTo={period_to},"
+                f"sourceType=0,sourceFilter='',"
+                f"destinationType=0,destinationFilter='',"
+                f"callsType=0,callTimeFilterType=0,"
+                f"callTimeFilterFrom='0:00:0',callTimeFilterTo='0:00:0',"
+                f"hidePcalls=true)"
+            )
+            resp = requests.get(
+                api_url(config, odata_fn), headers=headers,
+                params={"$top": "1000", "$orderby": "StartTime"},
+            )
             resp.raise_for_status()
             data = resp.json()
             log_entries = data.get("value", [])
@@ -292,41 +331,50 @@ def fetch_call_logs(config, db):
                 db.commit()
                 continue
 
-            # Match log entries to recordings by time overlap
+            # Match log entries to recordings — prefer direct RecId match, fall back to number+time
             for rec in recs:
-                try:
-                    rec_start = datetime.fromisoformat(rec["start"].replace("Z", "+00:00"))
-                    rec_end_str = rec["end"]
-                    rec_end = datetime.fromisoformat(rec_end_str.replace("Z", "+00:00")) if rec_end_str else rec_start + timedelta(hours=1)
-                except (ValueError, AttributeError):
-                    db.execute("UPDATE recordings SET call_log_synced=1 WHERE id=?", (rec["id"],))
-                    continue
-
-                # Find log entries overlapping this recording's time window (with 60s buffer)
-                window_start = rec_start - timedelta(seconds=60)
-                window_end = rec_end + timedelta(seconds=60)
-
                 matching_logs = []
+
+                # Strategy 1: Direct match via SrcRecId / DstRecId (most reliable)
                 for entry in log_entries:
+                    src_rec_id = entry.get("SrcRecId")
+                    dst_rec_id = entry.get("DstRecId")
+                    if src_rec_id == rec["id"] or dst_rec_id == rec["id"]:
+                        matching_logs.append(entry)
+
+                # Strategy 2: Fall back to time window + normalized number matching
+                if not matching_logs:
                     try:
-                        entry_start_str = entry.get("StartTime") or entry.get("start_time", "")
-                        entry_start = datetime.fromisoformat(entry_start_str.replace("Z", "+00:00"))
+                        rec_start = datetime.fromisoformat(rec["start"].replace("Z", "+00:00"))
+                        rec_end_str = rec["end"]
+                        rec_end = datetime.fromisoformat(rec_end_str.replace("Z", "+00:00")) if rec_end_str else rec_start + timedelta(hours=1)
                     except (ValueError, AttributeError):
+                        db.execute("UPDATE recordings SET call_log_synced=1 WHERE id=?", (rec["id"],))
                         continue
 
-                    if window_start <= entry_start <= window_end:
-                        # Check if participant numbers match
-                        entry_src = str(entry.get("SourceNumber", entry.get("Caller", "")))
-                        entry_dst = str(entry.get("DestinationNumber", entry.get("Callee", "")))
-                        rec_from = rec["from_num"]
-                        rec_to = rec["to_num"]
+                    window_start = rec_start - timedelta(seconds=60)
+                    window_end = rec_end + timedelta(seconds=60)
+                    norm_from = normalize_number(rec["from_num"])
+                    norm_to = normalize_number(rec["to_num"])
 
-                        # Require at least one participant number match
-                        if not rec_from and not rec_to:
-                            continue  # skip — can't match without numbers
-                        if (rec_from and (rec_from in entry_src or rec_from in entry_dst)) or \
-                           (rec_to and (rec_to in entry_src or rec_to in entry_dst)):
-                            matching_logs.append(entry)
+                    for entry in log_entries:
+                        try:
+                            entry_start_str = entry.get("StartTime", "")
+                            entry_start = datetime.fromisoformat(entry_start_str.replace("Z", "+00:00"))
+                        except (ValueError, AttributeError):
+                            continue
+
+                        if window_start <= entry_start <= window_end:
+                            entry_src = str(entry.get("SourceDn", entry.get("SourceCallerId", "")))
+                            entry_dst = str(entry.get("DestinationDn", entry.get("DestinationCallerId", "")))
+                            norm_src = normalize_number(entry_src)
+                            norm_dst = normalize_number(entry_dst)
+
+                            if not norm_from and not norm_to:
+                                continue
+                            if (norm_from and (numbers_match(norm_from, norm_src) or numbers_match(norm_from, norm_dst))) or \
+                               (norm_to and (numbers_match(norm_to, norm_src) or numbers_match(norm_to, norm_dst))):
+                                matching_logs.append(entry)
 
                 if matching_logs:
                     db.execute(
@@ -336,6 +384,10 @@ def fetch_call_logs(config, db):
                     )
                     matched += 1
                 else:
+                    if log_entries:
+                        print(f"    WARN: No match for rec {rec['id']} "
+                              f"(from={rec['from_num']}, to={rec['to_num']}) "
+                              f"against {len(log_entries)} log entries")
                     db.execute(
                         "UPDATE recordings SET call_log_synced=1, updated_at=datetime('now') WHERE id=?",
                         (rec["id"],)
@@ -375,6 +427,10 @@ def download_recordings(config, db):
         wav_path = os.path.join(RECORDINGS_DIR, f"recording_{rec_id}.wav")
         rel_path = f"recording_{rec_id}.wav"  # stored in DB as relative
 
+        # Mark as actively downloading
+        db.execute("UPDATE recordings SET processing_step='downloading' WHERE id=?", (rec_id,))
+        db.commit()
+
         try:
             headers = get_headers(config)
             resp = requests.get(
@@ -392,14 +448,14 @@ def download_recordings(config, db):
 
             if file_size == 0:
                 db.execute(
-                    "UPDATE recordings SET sync_status='error', error_message='Empty WAV file', "
+                    "UPDATE recordings SET processing_step=NULL, sync_status='error', error_message='Empty WAV file', "
                     "wav_path=?, wav_downloaded_at=?, wav_size_bytes=0, updated_at=datetime('now') "
                     "WHERE id=?",
                     (rel_path, now_str, rec_id)
                 )
             else:
                 db.execute(
-                    "UPDATE recordings SET sync_status='downloaded', wav_path=?, "
+                    "UPDATE recordings SET processing_step=NULL, sync_status='downloaded', wav_path=?, "
                     "wav_downloaded_at=?, wav_size_bytes=?, updated_at=datetime('now') WHERE id=?",
                     (rel_path, now_str, file_size, rec_id)
                 )
@@ -409,7 +465,7 @@ def download_recordings(config, db):
 
         except Exception as e:
             db.execute(
-                "UPDATE recordings SET sync_status='error', error_message=?, "
+                "UPDATE recordings SET processing_step=NULL, sync_status='error', error_message=?, "
                 "updated_at=datetime('now') WHERE id=?",
                 (f"Download failed: {e}", rec_id)
             )
@@ -457,6 +513,11 @@ def convert_to_opus(db, max_workers=4):
     print(f"  {len(rows)} recordings to convert ({max_workers} workers)")
     converted = 0
 
+    # Mark all as converting before starting parallel work
+    for rid, _ in rows:
+        db.execute("UPDATE recordings SET processing_step='converting' WHERE id=?", (rid,))
+    db.commit()
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_convert_single, rid, wp): rid for rid, wp in rows}
         for future in as_completed(futures):
@@ -464,18 +525,22 @@ def convert_to_opus(db, max_workers=4):
             try:
                 result = future.result()
                 if result is None:
+                    db.execute("UPDATE recordings SET processing_step=NULL WHERE id=?", (rec_id,))
+                    db.commit()
                     print(f"  SKIP: WAV missing for recording {rec_id}", file=sys.stderr)
                     continue
                 _, opus_filename, opus_size, wav_size = result
                 ratio = wav_size / opus_size if opus_size > 0 else 0
                 db.execute(
-                    "UPDATE recordings SET opus_path=?, opus_size_bytes=?, updated_at=datetime('now') WHERE id=?",
+                    "UPDATE recordings SET processing_step=NULL, opus_path=?, opus_size_bytes=?, updated_at=datetime('now') WHERE id=?",
                     (opus_filename, opus_size, rec_id)
                 )
                 db.commit()
                 converted += 1
                 print(f"  Converted {rec_id}: {wav_size}->{opus_size} bytes ({ratio:.0f}x)")
             except Exception as e:
+                db.execute("UPDATE recordings SET processing_step=NULL WHERE id=?", (rec_id,))
+                db.commit()
                 print(f"  ERROR converting {rec_id}: {e}", file=sys.stderr)
 
     print(f"  Done: {converted}/{len(rows)} converted successfully")
@@ -483,7 +548,7 @@ def convert_to_opus(db, max_workers=4):
 
 # -- Phase 3: Transcribe -------------------------------------------------------
 
-LOCALVOICE_STT_URL = os.environ.get("LOCALVOICE_STT_URL", "http://whisper-stt:8080")
+LOCALVOICE_STT_URL = os.environ.get("LOCALVOICE_STT_URL", "http://whisper-stt:8000")
 LOCALVOICE_API = f"{LOCALVOICE_STT_URL}/v1/audio/transcriptions"
 
 def transcribe_recordings(db):
@@ -512,14 +577,18 @@ def transcribe_recordings(db):
             print(f"  [{i}/{len(rows)}] ERROR: No audio for recording {rec_id}", file=sys.stderr)
             continue
 
+        # Mark as actively transcribing
+        db.execute("UPDATE recordings SET processing_step='transcribing' WHERE id=?", (rec_id,))
+        db.commit()
+
         try:
             with open(audio_file, "rb") as f:
                 # Determine model based on call_type
                 call_type_str = call_type_val or ""
                 if "Internal" in call_type_str or "Local" in call_type_str:
-                    model_name = "large-v3"
+                    model_name = "Systran/faster-whisper-large-v3"
                 else:
-                    model_name = "small.en"
+                    model_name = "Systran/faster-whisper-small.en"
 
                 form_data = {"model": model_name, "response_format": "verbose_json"}
                 if model_name != "small.en":
@@ -542,7 +611,7 @@ def transcribe_recordings(db):
                 seg["text"] = transliterate_text(seg.get("text", ""))
 
             db.execute(
-                "UPDATE recordings SET local_transcription=?, segments_json=?, local_language=?, "
+                "UPDATE recordings SET processing_step=NULL, local_transcription=?, segments_json=?, local_language=?, "
                 "local_duration=?, local_transcribed_at=?, local_model=?, sync_status='transcribed', "
                 "updated_at=datetime('now') WHERE id=?",
                 (
@@ -562,7 +631,7 @@ def transcribe_recordings(db):
 
         except requests.Timeout:
             db.execute(
-                "UPDATE recordings SET sync_status='error', error_message='Transcription timed out', "
+                "UPDATE recordings SET processing_step=NULL, sync_status='error', error_message='Transcription timed out', "
                 "updated_at=datetime('now') WHERE id=?",
                 (rec_id,)
             )
@@ -571,7 +640,7 @@ def transcribe_recordings(db):
 
         except Exception as e:
             db.execute(
-                "UPDATE recordings SET sync_status='error', error_message=?, "
+                "UPDATE recordings SET processing_step=NULL, sync_status='error', error_message=?, "
                 "updated_at=datetime('now') WHERE id=?",
                 (f"Transcription failed: {e}", rec_id)
             )
@@ -631,6 +700,10 @@ def diarize_recordings(db):
 
         if not audio_file:
             continue
+
+        # Mark as actively diarizing
+        db.execute("UPDATE recordings SET processing_step='diarizing' WHERE id=?", (rec_id,))
+        db.commit()
 
         try:
             # Determine speaker count hint from 3CX participant metadata
@@ -703,7 +776,7 @@ def diarize_recordings(db):
                     speaker_map[sorted_labels[1]]["name"] = second_name
 
             db.execute(
-                "UPDATE recordings SET diarization_json=?, speaker_map_json=?, "
+                "UPDATE recordings SET processing_step=NULL, diarization_json=?, speaker_map_json=?, "
                 "diarized_at=datetime('now'), sync_status_diar='diarized', "
                 "updated_at=datetime('now') WHERE id=?",
                 (
@@ -735,7 +808,7 @@ def diarize_recordings(db):
 
         except Exception as e:
             db.execute(
-                "UPDATE recordings SET sync_status_diar='error', "
+                "UPDATE recordings SET processing_step=NULL, sync_status_diar='error', "
                 "updated_at=datetime('now') WHERE id=?",
                 (rec_id,)
             )
@@ -751,6 +824,10 @@ def main():
     config = load_config()
 
     db = init_db()
+
+    # Clear stale processing_step values from previous sync that may have crashed
+    db.execute("UPDATE recordings SET processing_step=NULL WHERE processing_step IS NOT NULL")
+    db.commit()
 
     try:
         fetch_all_recordings(config, db)

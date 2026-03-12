@@ -34,3 +34,6 @@ test-results/
 
 # Data (recordings + DB - large binary files)
 data/
+
+~/.claude/
+*claude.*

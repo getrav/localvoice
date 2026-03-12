@@ -1,25 +1,10 @@
-.PHONY: stt-model stt-model-en stt-up stt-logs web-up sync-up sync-logs test
-
-STT_MODEL ?= small
-STT_MODEL_VOLUME ?= localvoice_whisper-models
-
-stt-model:
-	docker run --rm --entrypoint /bin/bash \
-		-v $(STT_MODEL_VOLUME):/models \
-		ghcr.io/ggml-org/whisper.cpp:main-vulkan \
-		-lc "./models/download-ggml-model.sh $(STT_MODEL) /models"
-
-stt-model-en:
-	docker run --rm --entrypoint /bin/bash \
-		-v $(STT_MODEL_VOLUME):/models \
-		ghcr.io/ggml-org/whisper.cpp:main-vulkan \
-		-lc "./models/download-ggml-model.sh small.en /models"
+.PHONY: stt-up stt-logs web-up sync-up sync-logs test
 
 stt-up:
-	docker compose up -d --build whispercpp-backend whispercpp-backend-en whisper-stt
+	docker compose up -d whisper-stt
 
 stt-logs:
-	docker compose logs --tail=120 whispercpp-backend whispercpp-backend-en whisper-stt
+	docker compose logs --tail=120 whisper-stt
 
 web-up:
 	docker compose up -d --build web

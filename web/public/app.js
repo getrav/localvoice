@@ -23,7 +23,8 @@
       // Trigger data loads on tab switch
       if (tab.dataset.tab === "stt") populateSttModels();
       if (tab.dataset.tab === "speakers") loadSpeakers();
-      if (tab.dataset.tab === "sync") { loadSyncProgress(); loadSyncTable(); initSyncCountdown(); }
+      if (tab.dataset.tab === "sync") { loadSyncProgress(); loadSyncTable(); initSyncCountdown(); startProcessingPoll(); }
+      else { stopProcessingPoll(); }
     });
   });
 
@@ -348,13 +349,30 @@
           fromSelect.insertAdjacentHTML("beforeend", `<option value="${esc(sp)}">${esc(sp)}</option>`);
         });
 
-        // Populate "to" dropdown with enrolled speakers
+        // Populate "to" dropdown with call participants + enrolled speakers
         const toSelect = detailTr.querySelector(`#edit-to-${rec.Id}`);
         const customInput = detailTr.querySelector(`#edit-custom-${rec.Id}`);
         toSelect.innerHTML = '<option value="">Speaker…</option>';
-        cachedSpeakers.forEach(s => {
-          toSelect.insertAdjacentHTML("beforeend", `<option value="${esc(s.name)}">${esc(s.name)}</option>`);
-        });
+
+        // Call participants from 3CX metadata
+        const participants = [detail.from_display_name, detail.to_display_name].filter(Boolean);
+        const uniqueParticipants = [...new Set(participants)];
+        const enrolledNames = new Set((cachedSpeakers || []).map(s => s.name));
+        const filteredParticipants = uniqueParticipants.filter(p => !enrolledNames.has(p));
+        if (filteredParticipants.length > 0) {
+          toSelect.insertAdjacentHTML("beforeend", '<optgroup label="Call Participants">');
+          filteredParticipants.forEach(p => {
+            toSelect.insertAdjacentHTML("beforeend", `<option value="${esc(p)}">${esc(p)}</option>`);
+          });
+          toSelect.insertAdjacentHTML("beforeend", '</optgroup>');
+        }
+        if (cachedSpeakers && cachedSpeakers.length > 0) {
+          toSelect.insertAdjacentHTML("beforeend", '<optgroup label="Enrolled Speakers">');
+          cachedSpeakers.forEach(s => {
+            toSelect.insertAdjacentHTML("beforeend", `<option value="${esc(s.name)}">${esc(s.name)}</option>`);
+          });
+          toSelect.insertAdjacentHTML("beforeend", '</optgroup>');
+        }
         toSelect.insertAdjacentHTML("beforeend", '<option value="__custom__">Custom…</option>');
         toSelect.addEventListener("change", () => {
           customInput.style.display = toSelect.value === "__custom__" ? "" : "none";
@@ -417,12 +435,37 @@
               const sel = document.createElement("select");
               sel.className = "speaker-select";
               sel.innerHTML = '<option value="">—</option>';
-              cachedSpeakers.forEach(s => {
-                const opt = document.createElement("option");
-                opt.value = s.name; opt.textContent = s.name;
-                if (s.name === segments[idx].speaker) opt.selected = true;
-                sel.appendChild(opt);
-              });
+
+              // Call participants optgroup
+              const inlineParticipants = [detail.from_display_name, detail.to_display_name].filter(Boolean);
+              const inlineUniqueParticipants = [...new Set(inlineParticipants)];
+              const inlineEnrolledNames = new Set((cachedSpeakers || []).map(s => s.name));
+              const inlineFilteredParticipants = inlineUniqueParticipants.filter(p => !inlineEnrolledNames.has(p));
+              if (inlineFilteredParticipants.length > 0) {
+                const pGroup = document.createElement("optgroup");
+                pGroup.label = "Call Participants";
+                inlineFilteredParticipants.forEach(p => {
+                  const opt = document.createElement("option");
+                  opt.value = p; opt.textContent = p;
+                  if (p === segments[idx].speaker) opt.selected = true;
+                  pGroup.appendChild(opt);
+                });
+                sel.appendChild(pGroup);
+              }
+
+              // Enrolled speakers optgroup
+              if (cachedSpeakers && cachedSpeakers.length > 0) {
+                const eGroup = document.createElement("optgroup");
+                eGroup.label = "Enrolled Speakers";
+                cachedSpeakers.forEach(s => {
+                  const opt = document.createElement("option");
+                  opt.value = s.name; opt.textContent = s.name;
+                  if (s.name === segments[idx].speaker) opt.selected = true;
+                  eGroup.appendChild(opt);
+                });
+                sel.appendChild(eGroup);
+              }
+
               const customOpt = document.createElement("option");
               customOpt.value = "__custom__"; customOpt.textContent = "Custom…";
               sel.appendChild(customOpt);
@@ -509,6 +552,17 @@
   });
 
   loadRecordings();
+
+
+    const recordingsRefreshBtn = document.getElementById("recordings-empty-refresh");
+    if (recordingsRefreshBtn) {
+      recordingsRefreshBtn.addEventListener("click", loadRecordings);
+    }
+
+    const syncRefreshBtn = document.getElementById("sync-empty-refresh");
+    if (syncRefreshBtn) {
+      syncRefreshBtn.addEventListener("click", loadSyncTable);
+    }
 
   // ── STT ────────────────────────────────────────────────────────────
 
@@ -623,10 +677,10 @@
       }
 
       if (active.length === 0) {
-        sttModel.innerHTML = '<option value="large-v3">large-v3 (Multilingual)</option><option value="small.en">small.en (English)</option>';
+        sttModel.innerHTML = '<option value="Systran/faster-whisper-large-v3">large-v3 (Multilingual)</option><option value="Systran/faster-whisper-small.en">small.en (English)</option>';
       }
     } catch {
-      sttModel.innerHTML = '<option value="large-v3">large-v3 (Multilingual)</option><option value="small.en">small.en (English)</option>';
+      sttModel.innerHTML = '<option value="Systran/faster-whisper-large-v3">large-v3 (Multilingual)</option><option value="Systran/faster-whisper-small.en">small.en (English)</option>';
     }
   }
 
@@ -693,8 +747,7 @@
       ttsDownload.href = url;
       ttsResult.hidden = false;
     } catch (err) {
-      ttsError.textContent = err.message;
-      ttsError.hidden = false;
+      showError(ttsError, err.message);
     } finally {
       ttsGenerate.disabled = false;
       ttsLoading.hidden = true;
@@ -739,6 +792,7 @@
   let syncPage = 0;
   let syncPageSize = 25;
   let syncStatusFilter = "";
+  let syncFilteredTotal = 0;
 
   async function loadSyncProgress() {
     try {
@@ -770,15 +824,75 @@
   loadSyncProgress();
   setInterval(loadSyncProgress, 30000);
 
+  // ── Currently Processing Panel (polls every 3s) ──────────────────
+
+  let processingPollInterval = null;
+
+  async function loadProcessingStatus() {
+    try {
+      const resp = await fetch("/api/sync/processing");
+      const data = await resp.json();
+      const panel = document.getElementById("sync-processing");
+      const list = document.getElementById("processing-list");
+      const pctEl = document.getElementById("sync-pct-complete");
+
+      // Update pipeline % complete
+      if (pctEl && data.pipeline) {
+        const { transcribed, total, pct_complete } = data.pipeline;
+        pctEl.textContent = total > 0 ? `${pct_complete}% complete (${transcribed}/${total} transcribed)` : "";
+      }
+
+      // Update processing panel
+      if (!data.processing || data.processing.length === 0) {
+        panel.hidden = true;
+        list.innerHTML = "";
+        return;
+      }
+
+      panel.hidden = false;
+      list.innerHTML = data.processing.map(r => {
+        const date = r.start_time ? new Date(r.start_time).toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+        const caller = r.from_display_name || "";
+        const called = r.to_display_name || "";
+        const dur = r.duration ? formatDuration(r.duration) : "";
+        return `<div class="processing-item">
+          <div class="processing-info">
+            <span>${esc(caller)}${caller && called ? " → " : ""}${esc(called)}</span>
+            <span class="processing-meta">#${r.id} · ${date}${dur ? " · " + dur : ""}</span>
+          </div>
+          <span class="step-badge" data-step="${esc(r.processing_step)}">${esc(r.processing_step)}</span>
+        </div>`;
+      }).join("");
+    } catch {}
+  }
+
+  function startProcessingPoll() {
+    if (processingPollInterval) return;
+    loadProcessingStatus();
+    processingPollInterval = setInterval(loadProcessingStatus, 3000);
+  }
+
+  function stopProcessingPoll() {
+    if (processingPollInterval) {
+      clearInterval(processingPollInterval);
+      processingPollInterval = null;
+    }
+  }
+
+  // Load initial % complete (runs once), polling starts when sync tab is opened
+  loadProcessingStatus();
+
   async function loadSyncTable() {
     const body = document.getElementById("sync-table-body");
     const loading = document.getElementById("sync-loading");
     const empty = document.getElementById("sync-empty");
     const pageInfoEl = document.getElementById("sync-page-info");
+    const syncError = document.getElementById("sync-error");
 
     loading.hidden = false;
     empty.hidden = true;
     body.innerHTML = "";
+    syncError.hidden = true;
 
     try {
       const offset = syncPage * syncPageSize;
@@ -789,6 +903,7 @@
       const data = await resp.json();
       const total = data.total || 0;
       const recordings = data.recordings || [];
+      syncFilteredTotal = total;
 
       loading.hidden = true;
 
@@ -804,8 +919,23 @@
         const isError = r.sync_status === "error";
         const isTranscribed = r.sync_status === "transcribed";
         let actions = "";
-        if (isError) actions = `<button class="btn-action" data-action="retranscribe" data-id="${r.id}">Reprocess</button>`;
-        if (isTranscribed) actions = `<button class="btn-action" data-action="retranscribe" data-id="${r.id}">Retranscribe</button> <button class="btn-action" data-action="retransliterate" data-id="${r.id}">Retransliterate</button>`;
+        switch (r.sync_status) {
+          case "pending":
+            actions = `<button class="btn-action" data-action="download" data-id="${r.id}">Download</button>`;
+            break;
+          case "downloaded":
+            actions = `<button class="btn-action" data-action="transcribe" data-id="${r.id}">Transcribe</button>`;
+            break;
+          case "transcribed":
+            actions = `<button class="btn-action" data-action="retranscribe" data-id="${r.id}">Retranscribe</button> <button class="btn-action" data-action="retransliterate" data-id="${r.id}">Retransliterate</button>`;
+            break;
+          case "error":
+            actions = `<button class="btn-action" data-action="retranscribe" data-id="${r.id}">Reprocess</button>`;
+            break;
+          default:
+            actions = `<button class="btn-action" disabled>No Action</button>`;
+            break;
+        }
 
         return `<tr>
           <td>${esc(r.id)}</td>
@@ -814,7 +944,7 @@
           <td>${esc(r.from_display_name || "")}</td>
           <td>${esc(r.to_display_name || "")}</td>
           <td>${esc(r.call_type || "")}</td>
-          <td><span class="status-badge${isError && r.error_message ? " error-tooltip" : ""}" data-status="${esc(r.sync_status)}"${isError && r.error_message ? ` data-error="${esc(r.error_message)}"` : ""}>${esc(r.sync_status)}</span></td>
+          <td><span class="status-badge${isError && r.error_message ? " error-tooltip" : ""}" data-status="${esc(r.sync_status)}"${isError && r.error_message ? ` data-error="${esc(r.error_message)}"` : ""}>${r.sync_status === "pending" ? "processing" : esc(r.sync_status)}</span>${r.processing_step ? ` <span class="step-badge" data-step="${esc(r.processing_step)}">${esc(r.processing_step)}</span>` : ""}</td>
           <td>${actions}</td>
         </tr>`;
       }).join("");
@@ -832,7 +962,8 @@
       document.getElementById("sync-next-page").disabled = (syncPage + 1) >= totalPages;
     } catch (err) {
       loading.hidden = true;
-      body.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--red)">Error: ${esc(err.message)}</td></tr>`;
+      body.innerHTML = ""; // Clear table body on error
+      showError(syncError, `Error: ${esc(err.message)}`);
     }
   }
   loadSyncTable();
@@ -880,10 +1011,18 @@
 
   document.getElementById("sync-bulk-retranscribe").addEventListener("click", async () => {
     const btn = document.getElementById("sync-bulk-retranscribe");
-    btn.textContent = "Processing...";
+    const origText = btn.textContent;
     btn.disabled = true;
+
+    const filterStatus = syncStatusFilter || "error";
+    if (!confirm(`Are you sure you want to retranscribe ${syncFilteredTotal} recordings with status "${filterStatus}"?`)) {
+      btn.textContent = origText;
+      btn.disabled = false;
+      return;
+    }
+
+    btn.textContent = "Processing...";
     try {
-      const filterStatus = syncStatusFilter || "error";
       const resp = await fetch("/api/recordings/bulk-action", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -894,14 +1033,14 @@
         btn.textContent = `Done (${data.count})`;
         loadSyncProgress();
         loadSyncTable();
-        setTimeout(() => { btn.textContent = "Retranscribe Filtered"; btn.disabled = false; }, 2000);
+        setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
       } else {
         btn.textContent = "Error";
-        setTimeout(() => { btn.textContent = "Retranscribe Filtered"; btn.disabled = false; }, 2000);
+        setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
       }
     } catch {
       btn.textContent = "Error";
-      setTimeout(() => { btn.textContent = "Retranscribe Filtered"; btn.disabled = false; }, 2000);
+      setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
     }
   });
 
@@ -1084,11 +1223,175 @@
 
         loadSpeakers();
       } catch (err) {
-        enrollResult.innerHTML = `<div style="color:var(--red)">Error: ${esc(err.message)}</div>`;
-        enrollResult.hidden = false;
+        showError(enrollResult, `Error: ${esc(err.message)}`);
       } finally {
         enrollSubmit.disabled = true;
         enrollLoading.hidden = true;
+      }
+    });
+  }
+
+  // ── Mic Recording Helper ──────────────────────────────────────────
+
+  function setupMicRecorder(btnId, timerId, onRecorded) {
+    const btn = document.getElementById(btnId);
+    const timerEl = document.getElementById(timerId);
+    if (!btn) return;
+
+    let mediaRecorder = null;
+    let chunks = [];
+    let timerInterval = null;
+    let startTime = 0;
+
+    btn.addEventListener("click", async () => {
+      if (mediaRecorder && mediaRecorder.state === "recording") {
+        // Stop recording
+        mediaRecorder.stop();
+        return;
+      }
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus" : "audio/webm";
+        mediaRecorder = new MediaRecorder(stream, { mimeType });
+        chunks = [];
+
+        mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+        mediaRecorder.onstop = () => {
+          stream.getTracks().forEach(t => t.stop());
+          clearInterval(timerInterval);
+          btn.textContent = "🎤 Record";
+          btn.classList.remove("recording");
+          timerEl.hidden = true;
+
+          const blob = new Blob(chunks, { type: mimeType });
+          const file = new File([blob], "mic-recording.webm", { type: mimeType });
+          onRecorded(file);
+        };
+
+        mediaRecorder.start();
+        startTime = Date.now();
+        btn.textContent = "⏹ Stop";
+        btn.classList.add("recording");
+        timerEl.hidden = false;
+        timerInterval = setInterval(() => {
+          const elapsed = Math.floor((Date.now() - startTime) / 1000);
+          const mm = Math.floor(elapsed / 60);
+          const ss = elapsed % 60;
+          timerEl.textContent = `${mm}:${ss.toString().padStart(2, "0")}`;
+        }, 200);
+      } catch (err) {
+        alert("Microphone access denied or unavailable: " + err.message);
+      }
+    });
+  }
+
+  // Enrollment mic
+  setupMicRecorder("enroll-mic-btn", "enroll-mic-timer", (file) => {
+    selectEnrollFile(file);
+  });
+
+  // ── Test Identification ──────────────────────────────────────────
+
+  const identifyDropZone = document.getElementById("identify-drop-zone");
+  const identifyFile = document.getElementById("identify-file");
+  const identifyFileInfo = document.getElementById("identify-file-info");
+  const identifyFilename = document.getElementById("identify-filename");
+  const identifyClear = document.getElementById("identify-clear");
+  const identifySubmit = document.getElementById("identify-submit");
+  const identifyLoading = document.getElementById("identify-loading");
+  const identifyResult = document.getElementById("identify-result");
+
+  let identifySelectedFile = null;
+
+  if (identifyDropZone) {
+    identifyDropZone.addEventListener("click", () => identifyFile.click());
+    identifyDropZone.addEventListener("dragover", (e) => { e.preventDefault(); identifyDropZone.classList.add("dragover"); });
+    identifyDropZone.addEventListener("dragleave", () => identifyDropZone.classList.remove("dragover"));
+    identifyDropZone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      identifyDropZone.classList.remove("dragover");
+      if (e.dataTransfer.files.length > 0) selectIdentifyFile(e.dataTransfer.files[0]);
+    });
+    identifyFile.addEventListener("change", () => {
+      if (identifyFile.files.length > 0) selectIdentifyFile(identifyFile.files[0]);
+    });
+  }
+
+  function selectIdentifyFile(file) {
+    identifySelectedFile = file;
+    identifyFilename.textContent = file.name;
+    identifyFileInfo.hidden = false;
+    identifyDropZone.hidden = true;
+    if (identifySubmit) identifySubmit.disabled = false;
+  }
+
+  if (identifyClear) {
+    identifyClear.addEventListener("click", () => {
+      identifySelectedFile = null;
+      identifyFile.value = "";
+      identifyFileInfo.hidden = true;
+      identifyDropZone.hidden = false;
+      if (identifySubmit) identifySubmit.disabled = true;
+      identifyResult.hidden = true;
+    });
+  }
+
+  // Identify mic
+  setupMicRecorder("identify-mic-btn", "identify-mic-timer", (file) => {
+    selectIdentifyFile(file);
+  });
+
+  if (identifySubmit) {
+    identifySubmit.addEventListener("click", async () => {
+      if (!identifySelectedFile) return;
+
+      identifySubmit.disabled = true;
+      identifyLoading.hidden = false;
+      identifyResult.hidden = true;
+
+      try {
+        const formData = new FormData();
+        formData.append("file", identifySelectedFile);
+
+        const resp = await fetch("/api/speakers/identify", { method: "POST", body: formData });
+        const data = await resp.json();
+
+        if (data.error) throw new Error(data.error);
+
+        const matchName = data.speaker || data.name || "Unknown";
+        const confidence = data.confidence != null ? (data.confidence * 100).toFixed(1) : "N/A";
+        const scores = data.scores || {};
+
+        let scoresHtml = "";
+        const sortedScores = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+        if (sortedScores.length > 0) {
+          scoresHtml = '<div class="identify-scores">' + sortedScores.map(([name, score]) => {
+            const pct = (score * 100).toFixed(1);
+            const barWidth = Math.max(2, Math.min(100, score * 100));
+            return `<div class="identify-score-row">
+              <span class="identify-score-name">${esc(name)}</span>
+              <div class="identify-score-bar-bg"><div class="identify-score-bar" style="width:${barWidth}%"></div></div>
+              <span class="identify-score-pct">${pct}%</span>
+            </div>`;
+          }).join("") + "</div>";
+        }
+
+        identifyResult.innerHTML = `
+          <div class="identify-match">
+            <strong>Match:</strong> ${esc(matchName)}
+            <span class="identify-confidence">(${confidence}% confidence)</span>
+          </div>
+          ${scoresHtml}
+        `;
+        identifyResult.hidden = false;
+      } catch (err) {
+        showError(identifyResult, `Error: ${esc(err.message)}`);
+      } finally {
+        identifySubmit.disabled = false;
+        identifyLoading.hidden = true;
       }
     });
   }
@@ -1103,20 +1406,47 @@
       const speakers = data.speakers || [];
 
       if (speakers.length === 0) {
-        list.innerHTML = '<div style="color:var(--text-muted);padding:16px">No speakers enrolled yet. Upload a voice sample above to get started.</div>';
+        list.innerHTML = `
+          <div class="empty">
+            No speakers enrolled yet. Upload a voice sample above to get started.
+            <button type="button" id="speakers-empty-enroll">Scroll to enroll</button>
+          </div>
+        `;
+        document.getElementById("speakers-empty-enroll").addEventListener("click", () => {
+          enrollName.focus();
+          enrollName.scrollIntoView({ behavior: "smooth", block: "center" });
+        });
         return;
       }
 
-      list.innerHTML = speakers.map(s => `
+      list.innerHTML = speakers.map(s => {
+        const dateStr = s.updated_at ? formatDate(s.updated_at) : (s.created_at ? formatDate(s.created_at) : "");
+        return `
         <div class="speaker-card">
           <div class="speaker-info">
             <span class="speaker-name">${esc(s.name)}</span>
+            <span class="speaker-meta">${s.num_samples} sample${s.num_samples > 1 ? "s" : ""}${dateStr ? " · " + dateStr : ""}</span>
             ${s.description ? `<span class="speaker-desc">${esc(s.description)}</span>` : ""}
-            <span class="speaker-meta">${s.num_samples} sample${s.num_samples > 1 ? "s" : ""}</span>
           </div>
-          <button class="btn-action speaker-delete" data-id="${esc(s.speaker_id)}" data-name="${esc(s.name)}">Delete</button>
+          <div class="speaker-actions">
+            <button class="btn-action speaker-add-sample" data-name="${esc(s.name)}" title="Add voice sample for ${esc(s.name)}">+ Add Sample</button>
+            <button class="btn-action speaker-delete" data-id="${esc(s.speaker_id)}" data-name="${esc(s.name)}" title="Delete voice profile for ${esc(s.name)}">Delete</button>
+          </div>
         </div>
-      `).join("");
+      `;
+      }).join("");
+
+      list.querySelectorAll(".speaker-add-sample").forEach(btn => {
+        btn.addEventListener("click", () => {
+          enrollName.value = btn.dataset.name;
+          enrollName.scrollIntoView({ behavior: "smooth", block: "center" });
+          updateEnrollButton();
+          // Focus the file input area after scroll
+          setTimeout(() => {
+            if (enrollDropZone && !enrollDropZone.hidden) enrollDropZone.click();
+          }, 400);
+        });
+      });
 
       list.querySelectorAll(".speaker-delete").forEach(btn => {
         btn.addEventListener("click", async () => {
@@ -1211,5 +1541,12 @@
     const m = Math.floor(seconds / 60);
     const s = Math.floor(seconds % 60);
     return `${m}:${s.toString().padStart(2, "0")}`;
+  }
+
+  function showError(el, message) {
+    el.textContent = message;
+    el.hidden = false;
+    el.tabIndex = -1;
+    el.focus();
   }
 })();

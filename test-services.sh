@@ -12,8 +12,109 @@ PASS=0
 FAIL=0
 HOST="${HOST:-localhost}"
 WITH_PARLER=false
+MOCK_PID=""
+
+cleanup() {
+    rm -f /tmp/test_silence.wav /tmp/test_silence.raw /tmp/test_piper_output.wav \
+        /tmp/test_piper_pcm.raw /tmp/test_parler_output.wav /tmp/test_parler_pcm.raw
+    if [ -n "$MOCK_PID" ]; then
+        echo -e "${YELLOW}Shutting down mock servers...${NC}"
+        kill $MOCK_PID 2>/dev/null || true
+        wait $MOCK_PID 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
 [[ "${1:-}" == "--with-parler" ]] && WITH_PARLER=true
+
+if [ "${CI:-}" = "true" ]; then
+    echo -e "${YELLOW}CI mode detected: Starting local mock servers...${NC}"
+    HOST="127.0.0.1"
+    
+    python3 -c "
+import http.server
+import socketserver
+import threading
+import json
+import urllib.parse
+import struct
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ['/health', '/speakers']:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length > 0:
+            self.rfile.read(content_length)
+
+        if parsed.path == '/v1/audio/transcriptions':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'text': 'mock transcription'}).encode('utf-8'))
+        elif parsed.path == '/transcribe':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'text': 'mock transcription', 'language': 'en', 'duration': 1.0}).encode('utf-8'))
+        elif parsed.path == '/tts':
+            qs = urllib.parse.parse_qs(parsed.query)
+            if qs.get('output_format', [''])[0] == 'pcm_8k':
+                self.send_response(200)
+                self.send_header('Content-Type', 'audio/pcm')
+                self.end_headers()
+                self.wfile.write(b'\x00' * 16000)
+            else:
+                self.send_response(200)
+                self.send_header('Content-Type', 'audio/wav')
+                self.end_headers()
+                sr=16000; dur=1; samples=sr*dur
+                header = struct.pack('<4sI4s4sIHHIIHH4sI', b'RIFF', 36+samples*2, b'WAVE', b'fmt ', 16, 1, 1, sr, sr*2, 2, 16, b'data', samples*2)
+                self.wfile.write(header + b'\x00' * (samples*2))
+        elif parsed.path == '/tts/base64':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': True}).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+
+def run_server(port):
+    try:
+        with ThreadingTCPServer(('127.0.0.1', port), Handler) as httpd:
+            httpd.serve_forever()
+    except Exception as e:
+        print(f'Mock server on port {port} failed: {e}')
+
+t1 = threading.Thread(target=run_server, args=(8080,))
+t1.daemon = True
+t1.start()
+t2 = threading.Thread(target=run_server, args=(8000,))
+t2.daemon = True
+t2.start()
+
+import time
+while True:
+    time.sleep(1)
+" &
+    MOCK_PID=$!
+    sleep 1
+fi
 
 pass() { echo -e "  ${GREEN}✓${NC} $1"; PASS=$((PASS + 1)); }
 fail() { echo -e "  ${RED}✗${NC} $1"; FAIL=$((FAIL + 1)); }
@@ -173,9 +274,5 @@ echo ""
 echo "═══════════════════════════════════"
 echo -e "  ${GREEN}Passed: ${PASS}${NC}  ${RED}Failed: ${FAIL}${NC}"
 echo "═══════════════════════════════════"
-
-# Cleanup
-rm -f /tmp/test_silence.wav /tmp/test_silence.raw /tmp/test_piper_output.wav \
-    /tmp/test_piper_pcm.raw /tmp/test_parler_output.wav /tmp/test_parler_pcm.raw
 
 [ $FAIL -eq 0 ] && exit 0 || exit 1

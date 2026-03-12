@@ -47,6 +47,8 @@ const RECORDINGS_DIR = process.env.RECORDINGS_DIR ?? "/data/recordings";
 
 // Open local SQLite DB (read-only for serving)
 let localDb: Database | null = null;
+let hasProcessingStep: boolean | null = null;
+
 function getLocalDb(): Database | null {
   if (localDb) return localDb;
   try {
@@ -55,6 +57,18 @@ function getLocalDb(): Database | null {
     return null;
   }
   return localDb;
+}
+
+/** Check if the processing_step column exists (added by sync migration). Caches true only. */
+function checkProcessingStepColumn(db: Database): boolean {
+  if (hasProcessingStep) return true;
+  try {
+    db.query("SELECT processing_step FROM recordings LIMIT 0").all();
+    hasProcessingStep = true;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const LOCALVOICE = {
@@ -77,6 +91,12 @@ const VOICE_PREFIX_LABELS: Record<string, string> = {
 
 const RETRANSCRIBE_RESET =
   "UPDATE recordings SET sync_status='downloaded', local_transcription=NULL, segments_json=NULL, " +
+  "local_language=NULL, local_duration=NULL, local_transcribed_at=NULL, local_model=NULL, " +
+  "updated_at=datetime('now')";
+
+const REDOWNLOAD_RESET =
+  "UPDATE recordings SET sync_status='pending', error_message=NULL, wav_path=NULL, wav_downloaded_at=NULL, " +
+  "wav_size_bytes=NULL, opus_path=NULL, opus_size_bytes=NULL, local_transcription=NULL, segments_json=NULL, " +
   "local_language=NULL, local_duration=NULL, local_transcribed_at=NULL, local_model=NULL, " +
   "updated_at=datetime('now')";
 
@@ -542,6 +562,16 @@ const DN_TYPE_LABELS: Record<number, string> = {
   6: "IVR", 7: "Fax", 8: "Parking", 16: "Group",
 };
 
+/** Parse ISO 8601 duration (e.g. "PT6M10.142094S") to seconds. */
+function parseIsoDuration(val: unknown): number | null {
+  if (val == null) return null;
+  if (typeof val === "number") return val;
+  const s = String(val);
+  const m = s.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?$/);
+  if (!m) return null;
+  return (parseInt(m[1] || "0") * 3600) + (parseInt(m[2] || "0") * 60) + parseFloat(m[3] || "0");
+}
+
 function handleRecordingCallLog(id: string): Response {
   const db = getLocalDb();
   if (!db) return Response.json({ error: "Database not available" }, { status: 503 });
@@ -561,15 +591,17 @@ function handleRecordingCallLog(id: string): Response {
     const segments = rawEntries.map((entry, i) => ({
       order: i + 1,
       source_name: entry.SourceDisplayName || entry.SourceName || entry.Caller || "",
-      source_number: entry.SourceNumber || entry.SourceDn || "",
-      source_type: DN_TYPE_LABELS[entry.SrcDnType as number ?? entry.SourceType as number] || String(entry.SrcDnType ?? entry.SourceType ?? ""),
+      source_number: entry.SourceDn || entry.SourceCallerId || "",
+      source_type: DN_TYPE_LABELS[entry.SourceType as number ?? entry.SrcDnType as number] || String(entry.SourceType ?? entry.SrcDnType ?? ""),
       dest_name: entry.DestinationDisplayName || entry.DestinationName || entry.Callee || "",
-      dest_number: entry.DestinationNumber || entry.DestinationDn || "",
-      dest_type: DN_TYPE_LABELS[entry.DstDnType as number ?? entry.DestinationType as number] || String(entry.DstDnType ?? entry.DestinationType ?? ""),
+      dest_number: entry.DestinationDn || entry.DestinationCallerId || "",
+      dest_type: DN_TYPE_LABELS[entry.DestinationType as number ?? entry.DstDnType as number] || String(entry.DestinationType ?? entry.DstDnType ?? ""),
       reason: entry.Reason || "",
-      ring_time: entry.RingingDuration ?? entry.RingTime ?? null,
-      talk_time: entry.TalkingDuration ?? entry.TalkTime ?? null,
+      ring_time: parseIsoDuration(entry.RingingDuration) ?? parseIsoDuration(entry.RingTime),
+      talk_time: parseIsoDuration(entry.TalkingDuration) ?? parseIsoDuration(entry.TalkTime),
       segment_start: entry.StartTime || entry.SegmentStartTime || "",
+      direction: entry.Direction || "",
+      status: entry.Status || "",
     }));
     return Response.json({ segments });
   } catch {
@@ -677,17 +709,52 @@ Bun.serve({
         return Response.json({ message: "Manual sync trigger not yet implemented" }, { status: 501 });
       }
 
+      // Currently processing recordings
+      if (path === "/api/sync/processing" && req.method === "GET") {
+        const db = getLocalDb();
+        if (!db) return Response.json({ error: "DB unavailable" }, { status: 503 });
+
+        const hasCol = checkProcessingStepColumn(db);
+        let processing: unknown[] = [];
+        if (hasCol) {
+          processing = db.query(
+            "SELECT id, start_time, from_display_name, to_display_name, processing_step, " +
+            "COALESCE(duration, local_duration) AS duration " +
+            "FROM recordings WHERE processing_step IS NOT NULL ORDER BY id"
+          ).all();
+        }
+
+        const stats = db.query(
+          "SELECT sync_status, COUNT(*) as count FROM recordings GROUP BY sync_status"
+        ).all() as Array<{ sync_status: string; count: number }>;
+        const totalRow = db.query("SELECT COUNT(*) as count FROM recordings").get() as { count: number };
+        const total = totalRow.count;
+
+        const pipeline: Record<string, number> = { pending: 0, downloaded: 0, transcribed: 0, error: 0 };
+        for (const s of stats) {
+          if (s.sync_status in pipeline) pipeline[s.sync_status] = s.count;
+        }
+        const pct_complete = total > 0 ? Math.round((pipeline.transcribed / total) * 100) : 0;
+
+        return Response.json({
+          processing,
+          pipeline: { ...pipeline, total, pct_complete },
+        });
+      }
+
       // Sync recordings list
       if (path === "/api/sync/recordings" && req.method === "GET") {
         const db = getLocalDb();
         if (!db) return Response.json({ error: "DB unavailable" }, { status: 503 });
+        const hasCol = checkProcessingStepColumn(db);
+        const extraCol = hasCol ? ", processing_step" : "";
         const status = url.searchParams.get("status");
         const limit = Number(url.searchParams.get("limit") ?? "25");
         const offset = Number(url.searchParams.get("offset") ?? "0");
         if (status) {
           const rows = db.query(
             "SELECT id, start_time, from_display_name, to_display_name, call_type, " +
-            "COALESCE(duration, local_duration) AS duration, sync_status, error_message " +
+            "COALESCE(duration, local_duration) AS duration, sync_status, error_message" + extraCol + " " +
             "FROM recordings WHERE sync_status = ? ORDER BY id DESC LIMIT ? OFFSET ?"
           ).all(status, limit, offset);
           const total = db.query("SELECT COUNT(*) as count FROM recordings WHERE sync_status = ?").get(status) as {count: number};
@@ -695,7 +762,7 @@ Bun.serve({
         } else {
           const rows = db.query(
             "SELECT id, start_time, from_display_name, to_display_name, call_type, " +
-            "COALESCE(duration, local_duration) AS duration, sync_status, error_message " +
+            "COALESCE(duration, local_duration) AS duration, sync_status, error_message" + extraCol + " " +
             "FROM recordings ORDER BY id DESC LIMIT ? OFFSET ?"
           ).all(limit, offset);
           const total = db.query("SELECT COUNT(*) as count FROM recordings").get() as {count: number};
@@ -710,6 +777,26 @@ Bun.serve({
         if (!db) return Response.json({ error: "DB unavailable" }, { status: 503 });
         const id = parseInt(retranscribeMatch[1], 10);
         db.run(`${RETRANSCRIBE_RESET} WHERE id=?`, [id]);
+        return Response.json({ success: true, id });
+      }
+
+      // Transcribe single recording (resets status to 'downloaded')
+      const transcribeMatch = path.match(/^\/api\/recordings\/(\d+)\/transcribe$/);
+      if (transcribeMatch && req.method === "POST") {
+        const db = getWriteDb();
+        if (!db) return Response.json({ error: "DB unavailable" }, { status: 503 });
+        const id = parseInt(transcribeMatch[1], 10);
+        db.run(`${RETRANSCRIBE_RESET} WHERE id=?`, [id]);
+        return Response.json({ success: true, id });
+      }
+
+      // Redownload single recording (resets status to 'pending')
+      const redownloadMatch = path.match(/^\/api\/recordings\/(\d+)\/download$/);
+      if (redownloadMatch && req.method === "POST") {
+        const db = getWriteDb();
+        if (!db) return Response.json({ error: "DB unavailable" }, { status: 503 });
+        const id = parseInt(redownloadMatch[1], 10);
+        db.run(`${REDOWNLOAD_RESET} WHERE id=?`, [id]);
         return Response.json({ success: true, id });
       }
 
@@ -767,6 +854,15 @@ Bun.serve({
       if (path === "/api/speakers/enroll" && req.method === "POST") {
         const formData = await req.formData();
         const resp = await fetch(`${LOCALVOICE.diarization}/enroll`, {
+          method: "POST",
+          body: formData,
+        });
+        return Response.json(await resp.json(), { status: resp.status });
+      }
+
+      if (path === "/api/speakers/identify" && req.method === "POST") {
+        const formData = await req.formData();
+        const resp = await fetch(`${LOCALVOICE.diarization}/identify`, {
           method: "POST",
           body: formData,
         });

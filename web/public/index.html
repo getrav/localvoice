@@ -19,12 +19,12 @@
   </header>
 
   <nav class="tabs">
-    <button class="tab active" data-tab="recordings">Recordings</button>
-    <button class="tab" data-tab="stt">Speech-to-Text</button>
-    <button class="tab" data-tab="tts">Text-to-Speech</button>
-    <button class="tab" data-tab="speakers">Speakers</button>
-    <button class="tab" data-tab="sync">Sync Status</button>
-    <button class="tab" data-tab="models">Models</button>
+    <button type="button" class="tab active" data-tab="recordings">Recordings</button>
+    <button type="button" class="tab" data-tab="stt">Speech-to-Text</button>
+    <button type="button" class="tab" data-tab="tts">Text-to-Speech</button>
+    <button type="button" class="tab" data-tab="speakers">Speakers</button>
+    <button type="button" class="tab" data-tab="sync">Sync Status</button>
+    <button type="button" class="tab" data-tab="models">Models</button>
   </nav>
 
   <!-- Recordings Tab -->
@@ -39,9 +39,9 @@
         </select>
       </label>
       <div class="pagination">
-        <button id="prev-page" disabled>Prev</button>
+        <button type="button" id="prev-page" disabled>Prev</button>
         <span id="page-info">Page 1</span>
-        <button id="next-page">Next</button>
+        <button type="button" id="next-page">Next</button>
       </div>
     </div>
     <table id="recordings-table">
@@ -59,7 +59,10 @@
       <tbody id="recordings-body"></tbody>
     </table>
     <div id="recordings-loading" class="loading">Loading recordings...</div>
-    <div id="recordings-empty" class="empty" hidden>No recordings found.</div>
+    <div id="recordings-empty" class="empty" hidden>
+      No recordings found.
+      <button type="button" id="recordings-empty-refresh">Refresh</button>
+    </div>
   </section>
 
   <!-- STT Tab -->
@@ -71,7 +74,7 @@
       </div>
       <div id="stt-file-info" hidden>
         <span id="stt-filename"></span>
-        <button id="stt-clear">Clear</button>
+        <button type="button" id="stt-clear">Clear</button>
       </div>
       <div class="stt-options">
         <label>Language:
@@ -100,13 +103,13 @@
         <label>
           <input type="checkbox" id="stt-transliterate"> Transliterate Hindi
         </label>
-        <button id="stt-transcribe" disabled>Transcribe</button>
+        <button type="button" id="stt-transcribe" disabled>Transcribe</button>
       </div>
       <div id="stt-loading" class="loading" hidden>Transcribing...</div>
       <div id="stt-result" hidden>
         <label>Transcription:</label>
         <textarea id="stt-text" readonly rows="8"></textarea>
-        <button id="stt-copy">Copy to Clipboard</button>
+        <button type="button" id="stt-copy">Copy to Clipboard</button>
       </div>
     </div>
   </section>
@@ -130,11 +133,13 @@
           </label>
         </div>
       </div>
-      <button id="tts-generate">Generate</button>
+      <button type="button" id="tts-generate">Generate</button>
       <div id="tts-loading" class="loading" hidden>Generating speech...</div>
       <div id="tts-error" class="tts-error" hidden></div>
       <div id="tts-result" hidden>
-        <audio id="tts-audio" controls preload="none"></audio>
+        <audio id="tts-audio" controls preload="none">
+          <track kind="captions" srclang="en" label="English" />
+        </audio>
         <a id="tts-download" download="speech.wav">Download WAV</a>
       </div>
     </div>
@@ -152,17 +157,46 @@
             <label>Name: <input type="text" id="enroll-name" placeholder="e.g. John Smith"></label>
             <label>Description: <input type="text" id="enroll-desc" placeholder="Optional"></label>
           </div>
-          <div id="enroll-drop-zone" class="drop-zone">
-            <p>Drag &amp; drop a voice sample (5-30s of speech), or click to select</p>
-            <input type="file" id="enroll-file" accept="audio/*" hidden>
+          <div class="enroll-audio-sources">
+            <div id="enroll-drop-zone" class="drop-zone">
+              <p>Drag &amp; drop a voice sample (5-30s of speech), or click to select</p>
+              <input type="file" id="enroll-file" accept="audio/*" hidden>
+            </div>
+            <div class="mic-section">
+              <button type="button" id="enroll-mic-btn" class="btn-mic" title="Record from microphone">🎤 Record</button>
+              <span id="enroll-mic-timer" class="mic-timer" hidden>0:00</span>
+            </div>
           </div>
           <div id="enroll-file-info" hidden>
             <span id="enroll-filename"></span>
-            <button id="enroll-clear">Clear</button>
+            <button type="button" id="enroll-clear">Clear</button>
           </div>
-          <button id="enroll-submit" disabled>Enroll Speaker</button>
+          <button type="button" id="enroll-submit" disabled>Enroll Speaker</button>
           <div id="enroll-loading" class="loading" hidden>Enrolling speaker...</div>
           <div id="enroll-result" hidden></div>
+        </div>
+      </div>
+
+      <div class="identify-section">
+        <h3>Test Identification</h3>
+        <div class="identify-form">
+          <div class="identify-audio-sources">
+            <div id="identify-drop-zone" class="drop-zone">
+              <p>Drag &amp; drop an audio clip to identify the speaker, or click to select</p>
+              <input type="file" id="identify-file" accept="audio/*" hidden>
+            </div>
+            <div class="mic-section">
+              <button type="button" id="identify-mic-btn" class="btn-mic" title="Record from microphone">🎤 Record</button>
+              <span id="identify-mic-timer" class="mic-timer" hidden>0:00</span>
+            </div>
+          </div>
+          <div id="identify-file-info" hidden>
+            <span id="identify-filename"></span>
+            <button type="button" id="identify-clear">Clear</button>
+          </div>
+          <button type="button" id="identify-submit" disabled>Identify Speaker</button>
+          <div id="identify-loading" class="loading" hidden>Identifying speaker...</div>
+          <div id="identify-result" hidden></div>
         </div>
       </div>
 
@@ -177,6 +211,10 @@
   <section id="tab-sync" class="tab-content">
     <div class="sync-container-full">
       <h2>Sync Pipeline Status</h2>
+      <div id="sync-processing" class="sync-processing-panel" hidden>
+        <h3>Currently Processing</h3>
+        <div id="processing-list" class="processing-list"></div>
+      </div>
       <div class="sync-timer">
         <span class="sync-timer-label">Next sync in:</span>
         <span id="sync-countdown" class="sync-countdown">--:--</span>
@@ -192,6 +230,7 @@
         <span id="sync-last-time" class="sync-last-time">Never</span>
       </div>
       <div id="sync-progress" class="sync-progress">
+        <div id="sync-pct-complete" class="sync-pct-complete"></div>
         <div class="sync-progress-bar">
           <div class="sync-progress-segment" data-status="transcribed" style="width:0%"></div>
           <div class="sync-progress-segment" data-status="downloaded" style="width:0%"></div>
@@ -201,7 +240,7 @@
         <div class="sync-progress-legend">
           <span class="sync-legend-item" data-status="transcribed"><span class="sync-legend-dot"></span> Transcribed: <span id="sync-pct-transcribed">0%</span> (<span id="sync-cnt-transcribed">0</span>)</span>
           <span class="sync-legend-item" data-status="downloaded"><span class="sync-legend-dot"></span> Downloaded: <span id="sync-pct-downloaded">0%</span> (<span id="sync-cnt-downloaded">0</span>)</span>
-          <span class="sync-legend-item" data-status="pending"><span class="sync-legend-dot"></span> Pending: <span id="sync-pct-pending">0%</span> (<span id="sync-cnt-pending">0</span>)</span>
+          <span class="sync-legend-item" data-status="pending"><span class="sync-legend-dot"></span> Processing: <span id="sync-pct-pending">0%</span> (<span id="sync-cnt-pending">0</span>)</span>
           <span class="sync-legend-item" data-status="error"><span class="sync-legend-dot"></span> Errors: <span id="sync-pct-error">0%</span> (<span id="sync-cnt-error">0</span>)</span>
           <span class="sync-legend-total">Total: <span id="sync-total">0</span></span>
         </div>
@@ -209,7 +248,7 @@
       <div class="controls">
         <div class="sync-controls-left">
           <label>Page size:
-            <select id="sync-page-size">
+            <select id="sync-page-size" title="Set the number of items per page for the sync table.">
               <option value="10">10</option>
               <option value="25" selected>25</option>
               <option value="50">50</option>
@@ -217,20 +256,21 @@
             </select>
           </label>
           <label>Status:
-            <select id="sync-status-filter">
+            <select id="sync-status-filter" title="Filter sync table by status.">
               <option value="">All</option>
-              <option value="pending">Pending</option>
+              <option value="pending">Processing</option>
               <option value="downloaded">Downloaded</option>
               <option value="transcribed">Transcribed</option>
               <option value="error">Error</option>
             </select>
           </label>
-          <button id="sync-bulk-retranscribe" class="btn-sm">Retranscribe Filtered</button>
+          <button type="button" id="sync-bulk-retranscribe" class="btn-sm" title="Retranscribe all filtered recordings.">Retranscribe Filtered</button>
         </div>
+        <div id="sync-error" class="error-banner" hidden></div>
         <div class="pagination">
-          <button id="sync-prev-page" disabled>Prev</button>
+          <button type="button" id="sync-prev-page" disabled>Prev</button>
           <span id="sync-page-info">Page 1</span>
-          <button id="sync-next-page">Next</button>
+          <button type="button" id="sync-next-page">Next</button>
         </div>
       </div>
       <table id="sync-table">
@@ -249,7 +289,10 @@
         <tbody id="sync-table-body"></tbody>
       </table>
       <div id="sync-loading" class="loading">Loading sync data...</div>
-      <div id="sync-empty" class="empty" hidden>No recordings found.</div>
+      <div id="sync-empty" class="empty" hidden>
+        No recordings found.
+        <button type="button" id="sync-empty-refresh">Refresh</button>
+      </div>
     </div>
   </section>
 
